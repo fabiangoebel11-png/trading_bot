@@ -1,101 +1,165 @@
-"""Statistical-arbitrage pairs strategy: rolling OLS hedge ratio + z-score signal.
+"""Trend-following / breakout strategy for crypto perpetual futures.
 
-The strategy is purely rule-based (no look-ahead): every value at index ``i``
-only uses information available up to and including candle ``i``. The
-backtester is responsible for applying the additional latency shift.
+Why this replaces the mean-reversion pairs approach: a Monte Carlo random-start
+stress test (``research/run_monte_carlo_stress_test.py``, 1000 windows) falsified
+the prior 10m BTC/ETH stat-arb pairs strategy -- 0% profitable windows, mean
+return ~ -70%, Sharpe consistently between -4 and -10. Crypto majors spend a
+large share of time in strong, persistent directional trends; a mean-reversion
+book systematically fights those moves (fights the trend, pays fees + funding
+while waiting for a reversion that often doesn't arrive before the stop is hit).
+
+This module implements a classic trend-following / breakout system instead:
+a Donchian-channel breakout for entries/exits, confirmed by an EMA regime
+filter, plus a minimum-volatility gate to avoid overtrading dead/choppy
+markets. This is the standard building block of managed-futures/CTA systems,
+which have a long, well-documented track record specifically in trending,
+fat-tailed markets such as commodities and crypto.
+
+Every signal is strictly causal: all rolling/EMA statistics at bar t use only
+data up to and including t, and the Donchian breakout bands are additionally
+shifted by one bar so a breakout is measured against the *prior* channel, not
+one that already includes the breakout bar itself.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 
-from core.config import StrategyConfig
-
-
-def rolling_hedge_ratio(price_a: pd.Series, price_b: pd.Series, window: int) -> pd.Series:
-    """Rolling OLS hedge ratio beta_t = argmin || price_a - beta * price_b ||, fit on the
-    trailing ``window`` candles (no intercept, matching the classic spread definition).
-
-    Vectorized via rolling sums (beta = sum(x*y) / sum(x*x)) instead of a per-bar Python
-    loop: turns an O(n * window) computation into O(n), which matters once walk-forward
-    validation re-fits this on every fold across a multi-year, sub-hourly history."""
-    # .shift(1): beta at bar t only uses the trailing window strictly *before* t
-    # (rows t-window .. t-1), matching the original per-bar loop and avoiding any
-    # same-bar look-ahead where the hedge ratio would "see" the price it is priced against.
-    xy_sum = (price_a * price_b).rolling(window=window).sum().shift(1)
-    xx_sum = (price_b * price_b).rolling(window=window).sum().shift(1)
-    hedge_ratio = xy_sum / xx_sum.replace(0, np.nan)
-    return hedge_ratio
+from core.config import TradingBotConfig, TrendConfig
 
 
-def rolling_hedge_ratio_sm(price_a: pd.Series, price_b: pd.Series, window: int) -> pd.Series:
-    """Reference implementation using statsmodels OLS (slower, used for validation/tests)."""
-    hedge_ratios = pd.Series(index=price_a.index, dtype=float)
-    for i in range(window, len(price_a)):
-        y = price_a.iloc[i - window : i]
-        x = price_b.iloc[i - window : i]
-        model = sm.OLS(y, x).fit()
-        hedge_ratios.iloc[i] = model.params.iloc[0]
-    return hedge_ratios
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
+    """Average True Range: rolling mean of the true range (max of high-low,
+    |high-prev_close|, |low-prev_close|)."""
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return true_range.rolling(window=window).mean()
 
 
-def compute_spread_and_zscore(
-    price_a: pd.Series, price_b: pd.Series, hedge_ratio: pd.Series, z_window: int
-) -> pd.DataFrame:
-    spread = price_a - hedge_ratio * price_b
-    rolling_mean = spread.rolling(window=z_window).mean()
-    rolling_std = spread.rolling(window=z_window).std()
-    zscore = (spread - rolling_mean) / rolling_std
-    return pd.DataFrame({"spread": spread, "zscore": zscore})
+def compute_donchian_channels(
+    high: pd.Series, low: pd.Series, entry_window: int, exit_window: int
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Return (upper_entry, lower_entry, upper_exit, lower_exit). All bands use
+    ``.shift(1)`` so bar t's bands are computed strictly from bars before t --
+    a breakout at t is measured against the channel that existed *before* t."""
+    upper_entry = high.rolling(window=entry_window).max().shift(1)
+    lower_entry = low.rolling(window=entry_window).min().shift(1)
+    upper_exit = high.rolling(window=exit_window).max().shift(1)
+    lower_exit = low.rolling(window=exit_window).min().shift(1)
+    return upper_entry, lower_entry, upper_exit, lower_exit
 
 
-def compute_trend_filter(price_a: pd.Series, window: int) -> pd.Series:
-    """Relative distance of price_a from its own SMA; large values indicate a strong
-    directional trend during which mean-reversion trades are disabled."""
-    sma = price_a.rolling(window=window).mean()
-    return (price_a - sma).abs() / sma
+def generate_trend_signals(ohlc: pd.DataFrame, config: TrendConfig) -> pd.DataFrame:
+    """``ohlc`` must have columns: open, high, low, close (single symbol).
 
-
-def generate_signals(
-    df: pd.DataFrame,
-    symbol_a: str,
-    symbol_b: str,
-    config: StrategyConfig,
-) -> pd.DataFrame:
-    """Compute hedge ratio, z-score, trend filter and the resulting position series.
-
-    Returns a copy of ``df`` enriched with: hedge_ratio, spread, zscore,
-    market_trend, position (in {-1, 0, 1}, no look-ahead).
+    Entry: breakout above the trailing Donchian high while the EMA regime filter
+    confirms an uptrend (long), or breakout below the trailing Donchian low while
+    the regime filter confirms a downtrend (short, if ``allow_short``).
+    Exit: price closes back through the tighter exit channel, or the EMA regime
+    flips against the open position.
+    A minimum-ATR% filter blocks new entries during dead/low-volatility chop,
+    where breakouts are mostly noise and just generate fee-eating whipsaws.
     """
-    out = df.copy()
-    price_a = out[symbol_a]
-    price_b = out[symbol_b]
+    close = ohlc["close"]
+    high = ohlc["high"]
+    low = ohlc["low"]
 
-    out["hedge_ratio"] = rolling_hedge_ratio(price_a, price_b, config.hedge_ratio_window)
-    spread_z = compute_spread_and_zscore(price_a, price_b, out["hedge_ratio"], config.zscore_window)
-    out["spread"] = spread_z["spread"]
-    out["zscore"] = spread_z["zscore"]
-    out["market_trend"] = compute_trend_filter(price_a, config.trend_filter_window)
+    out = ohlc.copy()
+    out["ema_fast"] = close.ewm(span=config.fast_ma_window, adjust=False).mean()
+    out["ema_slow"] = close.ewm(span=config.slow_ma_window, adjust=False).mean()
+    out["trend_bias"] = np.sign(out["ema_fast"] - out["ema_slow"])
+    out["atr"] = compute_atr(high, low, close, config.atr_window)
 
-    out = out.dropna()
+    upper_entry, lower_entry, upper_exit, lower_exit = compute_donchian_channels(
+        high, low, config.donchian_entry_window, config.donchian_exit_window
+    )
+    out["donchian_upper_entry"] = upper_entry
+    out["donchian_lower_entry"] = lower_entry
+    out["donchian_upper_exit"] = upper_exit
+    out["donchian_lower_exit"] = lower_exit
 
-    positions = []
-    current_pos = 0
-    for z, trending in zip(out["zscore"], out["market_trend"] > config.trend_threshold):
-        if abs(z) > config.stop_loss_z:
-            current_pos = 0
-        elif current_pos != 0:
-            if (current_pos == 1 and z >= -config.exit_z) or (
-                current_pos == -1 and z <= config.exit_z
-            ):
-                current_pos = 0
-        elif not trending:
-            if z < -config.entry_z:
-                current_pos = 1
-            elif z > config.entry_z:
-                current_pos = -1
-        positions.append(current_pos)
+    out = out.dropna(subset=["ema_slow", "donchian_upper_entry", "atr"])
+
+    positions = np.zeros(len(out), dtype=float)
+    current_pos = 0.0
+    closes = out["close"].to_numpy()
+    trends = out["trend_bias"].to_numpy()
+    atrs = out["atr"].to_numpy()
+    up_entry = out["donchian_upper_entry"].to_numpy()
+    low_entry = out["donchian_lower_entry"].to_numpy()
+    up_exit = out["donchian_upper_exit"].to_numpy()
+    low_exit = out["donchian_lower_exit"].to_numpy()
+
+    for i in range(len(out)):
+        c = closes[i]
+        trend = trends[i]
+        vol_ok = (atrs[i] / c) >= config.min_atr_pct if c else False
+
+        if current_pos > 0 and (c < low_exit[i] or trend < 0):
+            current_pos = 0.0
+        elif current_pos < 0 and (c > up_exit[i] or trend > 0):
+            current_pos = 0.0
+
+        if current_pos == 0.0 and vol_ok:
+            if c > up_entry[i] and trend > 0:
+                current_pos = 1.0
+            elif config.allow_short and c < low_entry[i] and trend < 0:
+                current_pos = -1.0
+
+        positions[i] = current_pos
 
     out["position"] = positions
     return out
+
+
+def generate_portfolio_signals(
+    multi_ohlc: dict[str, pd.DataFrame], 
+    config: TrendConfig, 
+    full_config: TradingBotConfig | None = None
+) -> dict[str, pd.DataFrame]:
+    """Generiert Trend-Signale und wendet optional ML-Konfidenzskalierung an."""
+    signals_dict = {
+        symbol: generate_trend_signals(ohlc, config)
+        for symbol, ohlc in multi_ohlc.items()
+    }
+
+    # ML-Konfidenz-Skalierung, falls aktiviert
+    if full_config is not None and getattr(full_config, "ml", None) and getattr(full_config.ml, "enabled", False):
+        try:
+            from core.ml.features import fetch_breadth_basket, fetch_macro_matrix
+            from core.ml.inference import apply_ml_confirmation, load_symbol_model, predict_trend_confidence
+
+            macro_df = fetch_macro_matrix(full_config.ml)
+            breadth_return = fetch_breadth_basket(full_config.data, full_config.ml)
+            for symbol, sig_df in signals_dict.items():
+                try:
+                    model, meta = load_symbol_model(symbol, full_config.ml)
+                    try:
+                        conf = predict_trend_confidence(
+                            sig_df, macro_df, model, meta, full_config.ml, breadth_return
+                        )
+                        signals_dict[symbol] = apply_ml_confirmation(sig_df, conf)
+                        print(f"  [ML] {symbol}: Konfidenz-Filter erfolgreich angewendet.")
+                    finally:
+                        # A fresh TCNTrendModel is instantiated (and moved to the
+                        # GPU) on every call. Explicitly drop the reference and
+                        # release cached CUDA memory now rather than waiting on
+                        # Python's GC, so repeated calls (walk-forward folds,
+                        # Monte Carlo, a future live polling loop) don't let
+                        # reserved VRAM creep up over a long-running process.
+                        del model
+                        try:
+                            import torch
+
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except ImportError:
+                            pass
+                except FileNotFoundError:
+                    print(f"  [ML] Kein Modell für {symbol} gefunden – nutze rohes Signal.")
+        except Exception as e:
+            print(f"  [ML-Warnung] Konfidenz-Skalierung übersprungen: {e}")
+
+    return signals_dict

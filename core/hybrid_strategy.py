@@ -1,5 +1,10 @@
-"""Hybrid strategy: gate the rule-based stat-arb position with an ML-predicted
-mean-reversion probability, trained strictly on past (train-fold) data only.
+"""DEPRECATED: ML mean-reversion gate for the retired stat-arb pairs strategy.
+
+Superseded by the trend-following pipeline (see ``core/strategy.py``) after a
+Monte Carlo stress test falsified the mean-reversion approach. Kept only for
+reference/history; ``MLConfig`` was removed from ``core.config`` and
+``core.strategy.generate_signals`` no longer exists, so this module will raise
+ImportError until/unless it is rewritten around trend-continuation features.
 """
 from __future__ import annotations
 

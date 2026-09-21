@@ -23,11 +23,34 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Transient/recoverable CCXT errors worth a short retry-with-backoff instead of
+# either crashing the poll loop or silently treating the call as failed.
+_TRANSIENT_CCXT_ERRORS = (
+    ccxt.NetworkError,  # includes RequestTimeout, ExchangeNotAvailable, DDoSProtection
+    ccxt.RateLimitExceeded,
+)
+
+
+def _call_with_retry(fn, *args, max_retries: int = 3, base_delay_s: float = 1.0, **kwargs):
+    """Retry a CCXT call a few times with exponential backoff on transient
+    network/rate-limit errors. Re-raises immediately on any other exception
+    (e.g. InsufficientFunds, InvalidOrder) since those are not retryable."""
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except _TRANSIENT_CCXT_ERRORS as exc:
+            last_exc = exc
+            delay = base_delay_s * (2**attempt)
+            print(f"[CCXT] transient error ({exc.__class__.__name__}): {exc} -- retry in {delay:.1f}s")
+            time.sleep(delay)
+    raise last_exc  # noqa: RSE102 - last_exc is always set if we reach here
+
 
 @dataclass
 class OrderResult:
     order_id: str | None
-    status: str  # "filled" | "open" | "canceled" | "dry_run"
+    status: str  # "filled" | "open" | "canceled" | "unknown" | "dry_run"
     filled_price: float | None
     is_maker: bool
 
@@ -56,6 +79,7 @@ class CCXTExchangeClient:
                 "apiKey": os.getenv(api_key_env, ""),
                 "secret": os.getenv(api_secret_env, ""),
                 "enableRateLimit": True,
+                "timeout": 15_000,  # ms; avoid hanging indefinitely on a stalled API/crash-day congestion
                 "options": {"defaultType": market_type},
             }
         )
@@ -74,8 +98,55 @@ class CCXTExchangeClient:
             return
         self.exchange.set_leverage(int(leverage), symbol)
 
+    def fetch_equity(self, quote_currency: str = "USDT", fallback_equity: float = 0.0) -> float:
+        """Total account equity in ``quote_currency`` (free + used margin), used
+        by the live trader as the shared wallet's current size for position
+        sizing. Falls back to ``fallback_equity`` (e.g. the configured starting
+        capital) in dry-run mode or if the exchange call fails, rather than
+        crashing the poll loop over a transient balance-fetch error."""
+        if self.dry_run:
+            return fallback_equity
+        try:
+            balance = _call_with_retry(self.exchange.fetch_balance)
+            total = balance.get("total", {}).get(quote_currency)
+            return float(total) if total is not None else fallback_equity
+        except Exception as exc:  # noqa: BLE001 - never let a balance-fetch failure crash the live loop
+            print(f"[CCXT] fetch_equity failed: {exc} -- falling back to {fallback_equity}")
+            return fallback_equity
+
+    def fetch_signed_position_amount(self, symbol: str) -> float:
+        """Signed base-asset position size currently held on the exchange
+        (positive = long, negative = short, 0.0 = flat), used to seed/reconcile
+        ``LiveTrader``'s in-memory position tracking at startup so short/flip
+        order sizing (buy vs. sell, and how much) is computed from the real
+        exchange state rather than an assumed-flat 0 -- critical for the short
+        side, since a wrong assumed sign here silently mis-sizes the very next
+        rebalancing order. Falls back to 0.0 in dry-run mode or on any fetch
+        error (matches ``fetch_equity``'s fail-safe rather than fail-crash
+        behavior for a non-critical bookkeeping read)."""
+        if self.dry_run:
+            return 0.0
+        try:
+            positions = _call_with_retry(self.exchange.fetch_positions, [symbol])
+        except Exception as exc:  # noqa: BLE001 - never let this crash the live loop
+            print(f"[CCXT] fetch_signed_position_amount failed for {symbol}: {exc} -- assuming flat")
+            return 0.0
+        for pos in positions:
+            contracts = pos.get("contracts") or 0.0
+            if not contracts:
+                continue
+            side = (pos.get("side") or "").lower()
+            sign = -1.0 if side == "short" else 1.0
+            return sign * abs(float(contracts))
+        return 0.0
+
     def fetch_order_book_top(self, symbol: str) -> tuple[float, float]:
-        book = self.exchange.fetch_order_book(symbol, limit=5)
+        book = _call_with_retry(self.exchange.fetch_order_book, symbol, limit=5)
+        if not book["bids"] or not book["asks"]:
+            # Empty book (delisting, extreme illiquidity, exchange outage): no
+            # safe price to quote against -- surface this explicitly instead
+            # of crashing on an IndexError deep inside order placement.
+            raise RuntimeError(f"Empty order book for {symbol}: cannot determine a maker quote price")
         return book["bids"][0][0], book["asks"][0][0]
 
     def place_maker_order(
@@ -99,7 +170,8 @@ class CCXTExchangeClient:
             return OrderResult(order_id=None, status="dry_run", filled_price=quote_price, is_maker=True)
 
         for attempt in range(max_reprices + 1):
-            order = self.exchange.create_order(
+            order = _call_with_retry(
+                self.exchange.create_order,
                 symbol,
                 type="limit",
                 side=side,
@@ -111,13 +183,28 @@ class CCXTExchangeClient:
             deadline = time.time() + reprice_timeout_s
             while time.time() < deadline:
                 time.sleep(0.5)
-                status = self.exchange.fetch_order(order_id, symbol)
+                try:
+                    status = _call_with_retry(self.exchange.fetch_order, order_id, symbol, max_retries=2)
+                except Exception as exc:  # noqa: BLE001 - can't confirm state, don't guess
+                    # We genuinely don't know if this order filled (it may have,
+                    # with the confirmation lost to the network error). Treating
+                    # this as "canceled" would make the caller re-place a
+                    # duplicate order into what could already be an open
+                    # position/order. Surface it as "unknown" so the caller can
+                    # refuse to update its position state and require a manual
+                    # reconciliation instead of silently doubling exposure.
+                    print(f"[CCXT] fetch_order failed for {order_id} ({symbol}): {exc} -- state unknown")
+                    return OrderResult(order_id, "unknown", None, True)
                 if status["status"] == "closed":
                     return OrderResult(order_id, "filled", status.get("average") or quote_price, True)
                 if status["status"] == "canceled":
                     break
 
-            self.exchange.cancel_order(order_id, symbol)
+            try:
+                _call_with_retry(self.exchange.cancel_order, order_id, symbol, max_retries=2)
+            except Exception as exc:  # noqa: BLE001 - cancel failing doesn't mean the order is gone
+                print(f"[CCXT] cancel_order failed for {order_id} ({symbol}): {exc} -- state unknown")
+                return OrderResult(order_id, "unknown", None, True)
             best_bid, best_ask = self.fetch_order_book_top(symbol)
             quote_price = best_bid if side == "buy" else best_ask
 
@@ -129,7 +216,7 @@ class CCXTExchangeClient:
         if self.dry_run:
             print(f"[DRY_RUN] taker {side} {amount} {symbol}")
             return OrderResult(order_id=None, status="dry_run", filled_price=None, is_maker=False)
-        order = self.exchange.create_order(symbol, type="market", side=side, amount=amount)
+        order = _call_with_retry(self.exchange.create_order, symbol, type="market", side=side, amount=amount)
         return OrderResult(order["id"], "filled", order.get("average"), False)
 
 

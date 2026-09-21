@@ -87,38 +87,51 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     )
 
 
-def load_pair_data(config: DataConfig) -> pd.DataFrame:
-    """Load, resample and align close prices for the configured pair."""
-    raw_a = fetch_ohlcv_history(
-        config.symbol_a,
-        config.base_timeframe,
-        config.history_days,
-        cache_dir=config.cache_dir,
-        exchange_id=config.exchange_id,
-        market_type=config.market_type,
-    )
-    raw_b = fetch_ohlcv_history(
-        config.symbol_b,
-        config.base_timeframe,
-        config.history_days,
-        cache_dir=config.cache_dir,
-        exchange_id=config.exchange_id,
-        market_type=config.market_type,
-    )
+def drop_incomplete_last_candle(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Drop the last row if it is a still-forming (not yet closed) candle.
 
-    res_a = resample_ohlcv(raw_a, config.resample_to) if config.resample_to else raw_a
-    res_b = resample_ohlcv(raw_b, config.resample_to) if config.resample_to else raw_b
+    CCXT's ``fetch_ohlcv`` includes the currently-open candle as its last
+    element on most exchanges -- its high/low/close keep changing until the
+    candle actually closes. The backtester only ever sees fully closed,
+    static historical candles, so feeding the live poller's in-progress
+    candle into the exact same signal logic would make live decisions based
+    on data the backtest never had (and would keep flip-flopping every poll
+    as the open candle updates), a live/backtest mismatch rather than a
+    genuine future-leak but with the same practical effect of invalidating
+    the backtested edge.
+    """
+    if df.empty:
+        return df
+    candle_duration = pd.Timedelta(timeframe)
+    last_close_time = df.index[-1] + candle_duration
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    return df.iloc[:-1] if now < last_close_time else df
 
-    df = pd.DataFrame(
-        {
-            config.symbol_a: res_a["close"],
-            config.symbol_b: res_b["close"],
-            f"{config.symbol_a}_high": res_a["high"],
-            f"{config.symbol_a}_low": res_a["low"],
-            f"{config.symbol_b}_high": res_b["high"],
-            f"{config.symbol_b}_low": res_b["low"],
-        }
-    ).dropna()
 
-    print(f"✅ Synchronisiert: {len(df)} gemeinsame {config.resample_to or config.base_timeframe}-Kerzen.")
-    return df
+def load_multi_asset_data(config: DataConfig) -> dict[str, pd.DataFrame]:
+    """Load, resample and align OHLC data for every symbol in ``config.symbols``.
+
+    Returns one DataFrame per symbol (columns: open, high, low, close), all
+    reindexed onto the intersection of their timestamps so a multi-asset trend
+    portfolio can combine per-symbol returns bar-by-bar without gaps."""
+    raw = {}
+    for symbol in config.symbols:
+        history = fetch_ohlcv_history(
+            symbol,
+            config.base_timeframe,
+            config.history_days,
+            cache_dir=config.cache_dir,
+            exchange_id=config.exchange_id,
+            market_type=config.market_type,
+        )
+        raw[symbol] = resample_ohlcv(history, config.resample_to) if config.resample_to else history
+
+    common_index = raw[config.symbols[0]].index
+    for df in raw.values():
+        common_index = common_index.intersection(df.index)
+
+    aligned = {symbol: df.loc[common_index, ["open", "high", "low", "close"]].sort_index() for symbol, df in raw.items()}
+
+    timeframe_label = config.resample_to or config.base_timeframe
+    print(f"✅ Synchronisiert: {len(common_index)} gemeinsame {timeframe_label}-Kerzen über {len(config.symbols)} Symbole.")
+    return aligned

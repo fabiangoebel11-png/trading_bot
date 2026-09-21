@@ -2,10 +2,10 @@
 name = "trading-bot"
 version = "0.1.0"
 description = "Statistical-arbitrage crypto trading system (CCXT / Binance USDT-M Futures)"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"  # torch CUDA wheels for the RTX 3070 don't yet ship cp314 wheels
 dependencies = [
     "ccxt>=4.3.0",
-    "pandas>=2.2.0",
+    "pandas>=2.2.0,<3.0",
     "numpy>=1.26.0",
     "statsmodels>=0.14.0",
     "scikit-learn>=1.4.0",
@@ -21,6 +21,18 @@ ml = [
 ]
 
 [tool.uv]
+
+[tool.uv.sources]
+# CUDA-enabled wheel for the RTX 3070 (the default PyPI wheel is CPU-only on
+# Windows). If a future machine has no matching NVIDIA driver, `uv sync
+# --extra ml` will still succeed by falling back to CPU inference/training.
+torch = [{ index = "pytorch-cu124" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
 
 [dependency-groups]
 dev = [
