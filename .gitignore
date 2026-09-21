@@ -1,0 +1,12 @@
+# Environments
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# API Keys & Configs (Sehr wichtig für später!)
+.env
+/config.py
+*.json
