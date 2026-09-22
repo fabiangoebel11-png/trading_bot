@@ -10,3 +10,9 @@ __pycache__/
 .env
 /config.py
 *.json
+
+# Trained models ARE meant to be shared across machines (via git) instead of
+# retrained on every clone -- re-allow the metadata sidecar the blanket
+# *.json rule above would otherwise exclude (the .pt weights aren't matched
+# by any rule and are already tracked).
+!data/models/*.json

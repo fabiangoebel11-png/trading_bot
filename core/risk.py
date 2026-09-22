@@ -41,16 +41,19 @@ def dynamic_leverage(
     return leverage.fillna(config.base_leverage)
 
 
-def apply_dynamic_stop(positions: pd.Series, spread: pd.Series, stop_distance: pd.Series) -> pd.Series:
-    """ATR-trailing stop: once a position opens, its stop level ratchets in the
-    position's favor every bar (only ever moves up for longs / down for shorts,
-    tracking ``price -/+ stop_distance``) and force-flattens the position the bar
-    the price crosses it. Unlike a fixed stop anchored to the entry price, this
-    locks in open profit as a trend extends instead of only protecting against
-    the initial entry level."""
+def apply_dynamic_stop_with_level(
+    positions: pd.Series, spread: pd.Series, stop_distance: pd.Series
+) -> tuple[pd.Series, pd.Series]:
+    """Same ATR-trailing-stop ratchet as ``apply_dynamic_stop``, additionally
+    returning the raw per-bar stop level (NaN while flat) alongside the
+    position outcome. The level is needed by the live trader to mirror the
+    stop as a real server-side order on the exchange (``apply_dynamic_stop``
+    itself only ever exposes the resulting position, not the price level that
+    produced it)."""
     pos = positions.to_numpy(dtype=float).copy()
     price = spread.to_numpy(dtype=float)
     dist = stop_distance.to_numpy(dtype=float)
+    levels = np.full(len(pos), np.nan)
 
     stop_level = np.nan
     prev_pos = 0.0
@@ -69,9 +72,22 @@ def apply_dynamic_stop(positions: pd.Series, spread: pd.Series, stop_distance: p
             if (p > 0 and price[i] < stop_level) or (p < 0 and price[i] > stop_level):
                 pos[i] = 0.0
                 stop_level = np.nan
+        levels[i] = stop_level
         prev_pos = pos[i]
 
-    return pd.Series(pos, index=positions.index)
+    return pd.Series(pos, index=positions.index), pd.Series(levels, index=positions.index)
+
+
+def apply_dynamic_stop(positions: pd.Series, spread: pd.Series, stop_distance: pd.Series) -> pd.Series:
+    """ATR-trailing stop: once a position opens, its stop level ratchets in the
+    position's favor every bar (only ever moves up for longs / down for shorts,
+    tracking ``price -/+ stop_distance``) and force-flattens the position the bar
+    the price crosses it. Unlike a fixed stop anchored to the entry price, this
+    locks in open profit as a trend extends instead of only protecting against
+    the initial entry level."""
+    pos, _ = apply_dynamic_stop_with_level(positions, spread, stop_distance)
+    return pos
+
 
 
 def apply_trade_cooldown(position: pd.Series, cooldown_candles: int) -> pd.Series:

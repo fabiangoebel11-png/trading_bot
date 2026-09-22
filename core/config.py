@@ -11,6 +11,25 @@ test falsified it (0% profitable windows). ``TrendConfig`` replaces it; see
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# Repo root (core/config.py -> core/ -> repo root), so cache/model paths are
+# resolved robustly regardless of the process's current working directory
+# (cron/systemd/Task Scheduler on a freshly cloned machine may launch from a
+# different cwd than an interactive shell).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _default_data_dir() -> str:
+    return str(_PROJECT_ROOT / "data")
+
+
+def _default_model_dir() -> str:
+    return str(_PROJECT_ROOT / "data" / "models")
+
+
+def _default_monte_carlo_dir() -> str:
+    return str(_PROJECT_ROOT / "data" / "monte_carlo")
 
 
 @dataclass
@@ -24,7 +43,7 @@ class DataConfig:
     base_timeframe: str = "1h"  # stabler, less noisy timeframe than 10m for trend-following
     resample_to: str | None = None  # optional further downsample, e.g. "4h"
     history_days: int = 2500  # >= 3 years
-    cache_dir: str = "data"
+    cache_dir: str = field(default_factory=_default_data_dir)
 
     def __post_init__(self) -> None:
         if len(self.symbols) > 3:
@@ -74,7 +93,7 @@ class FundingConfig:
     event bars (~every 8h) using the position/leverage held at that moment."""
 
     enabled: bool = True
-    cache_dir: str = "data"
+    cache_dir: str = field(default_factory=_default_data_dir)
 
 
 @dataclass
@@ -111,7 +130,7 @@ class MacroConfig:
     vix_zscore_window: int = 60
     vix_zscore_threshold: float = 2.0  # VIX rolling z-score spike that triggers risk-off
     reporting_lag_days: int = 1  # daily close only usable from the next day onward (no look-ahead)
-    cache_dir: str = "data"
+    cache_dir: str = field(default_factory=_default_data_dir)
 
 
 @dataclass
@@ -125,7 +144,7 @@ class MonteCarloConfig:
     window_days: int = 365  # length of each simulated window
     random_seed: int = 42
     use_gpu: bool = True  # batched tensor computation on the RTX 3070 if available
-    output_dir: str = "data/monte_carlo"
+    output_dir: str = field(default_factory=_default_monte_carlo_dir)
 
 
 @dataclass
@@ -161,7 +180,7 @@ class TrendMLConfig:
     macro_symbols: list[str] = field(default_factory=lambda: ["ES=F", "NQ=F", "^VIX", "URTH"])
     macro_lookback_days: int = 1095
     macro_reporting_lag_days: int = 1
-    macro_cache_dir: str = "data"
+    macro_cache_dir: str = field(default_factory=_default_data_dir)
 
     # Cross-coin systemic-noise context ("rest of the crypto market" proxy).
     # TOTAL2/TOTAL3 market-cap indices are not available via ccxt/yfinance, so
@@ -209,7 +228,7 @@ class TrendMLConfig:
     embargo_fraction: float = 0.01  # fraction of total bars purged/embargoed around each test fold
 
     random_state: int = 42
-    model_dir: str = "data/models"
+    model_dir: str = field(default_factory=_default_model_dir)
 
 
 @dataclass

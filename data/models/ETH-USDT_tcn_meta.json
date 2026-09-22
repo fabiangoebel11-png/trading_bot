@@ -1,0 +1,88 @@
+{
+  "symbol": "ETH/USDT",
+  "feature_columns": [
+    "log_ret_1",
+    "log_ret_3",
+    "log_ret_6",
+    "log_ret_12",
+    "log_ret_24",
+    "log_ret_48",
+    "realized_vol_12",
+    "realized_vol_48",
+    "realized_vol_288",
+    "atr_pct",
+    "ema_fast_dist",
+    "ema_slow_dist",
+    "ema_regime",
+    "donchian_upper_dist",
+    "donchian_lower_dist",
+    "donchian_exit_upper_dist",
+    "donchian_exit_lower_dist",
+    "rsi_14",
+    "volume_zscore",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "ESF_ret",
+    "ESF_vol20",
+    "ESF_zscore60",
+    "NQF_ret",
+    "NQF_vol20",
+    "NQF_zscore60",
+    "VIX_ret",
+    "VIX_vol20",
+    "VIX_zscore60",
+    "URTH_ret",
+    "URTH_vol20",
+    "URTH_zscore60",
+    "breadth_ret_1",
+    "breadth_ret_6",
+    "breadth_vol",
+    "breadth_zscore",
+    "breadth_corr"
+  ],
+  "sequence_length": 64,
+  "walk_forward_metrics": [
+    {
+      "n_test": 48402,
+      "accuracy": 0.46636502623858517,
+      "directional_hit_rate": 0.4935987372851631,
+      "directional_edge": -0.009896411516893184,
+      "fold": 0,
+      "n_train": 45498
+    },
+    {
+      "n_test": 48402,
+      "accuracy": 0.4785132845750176,
+      "directional_hit_rate": 0.5061766184926865,
+      "directional_edge": 0.008946021380215477,
+      "fold": 1,
+      "n_train": 93900
+    },
+    {
+      "n_test": 48402,
+      "accuracy": 0.48210817734804345,
+      "directional_hit_rate": 0.5087393894429049,
+      "directional_edge": 0.02112172021141936,
+      "fold": 2,
+      "n_train": 142302
+    },
+    {
+      "n_test": 48402,
+      "accuracy": 0.4638651295401017,
+      "directional_hit_rate": 0.4975017210366192,
+      "directional_edge": -0.013220989699085861,
+      "fold": 3,
+      "n_train": 190704
+    },
+    {
+      "n_test": 48406,
+      "accuracy": 0.4676692971945627,
+      "directional_hit_rate": 0.4996891927892727,
+      "directional_edge": -0.0010575247541086223,
+      "fold": 4,
+      "n_train": 239106
+    }
+  ]
+}

@@ -219,6 +219,68 @@ class CCXTExchangeClient:
         order = _call_with_retry(self.exchange.create_order, symbol, type="market", side=side, amount=amount)
         return OrderResult(order["id"], "filled", order.get("average"), False)
 
+    def place_stop_loss_order(
+        self, symbol: str, position_side: str, amount: float, stop_price: float
+    ) -> OrderResult:
+        """Place a real, server-side reduce-only stop order ("catastrophe
+        stop"): if this process crashes, loses network, or the poll loop
+        stalls, the exchange itself still force-closes the position at
+        ``stop_price`` -- the in-memory ATR-trailing stop (``core.risk.
+        apply_dynamic_stop``) only protects while the bot is actively polling.
+        ``position_side`` is the side being protected ("long"/"short"); the
+        stop order itself is the opposite side (sell stop under a long,
+        buy stop above a short). Order type string is Binance-specific
+        (STOP_MARKET); other CCXT venues may need a different unified type.
+        """
+        side = "sell" if position_side == "long" else "buy"
+        if self.dry_run:
+            print(f"[DRY_RUN] stop_market {side} {amount} {symbol} @ stop={stop_price}")
+            return OrderResult(order_id=None, status="dry_run", filled_price=None, is_maker=False)
+        order = _call_with_retry(
+            self.exchange.create_order,
+            symbol,
+            type="STOP_MARKET",
+            side=side,
+            amount=amount,
+            params={"stopPrice": stop_price, "reduceOnly": True},
+        )
+        return OrderResult(order["id"], "open", None, False)
+
+    def cancel_stop_loss_order(self, symbol: str, order_id: str) -> None:
+        """Best-effort cancel of a previously placed stop order (e.g. before
+        re-quoting it at a new ATR-trailing level). Does not raise: if the
+        order already triggered/was already canceled, there is nothing to
+        clean up, and the caller (``LiveTrader``) always re-derives the
+        correct in-memory state from its own tracking afterward."""
+        if self.dry_run:
+            print(f"[DRY_RUN] cancel stop order {order_id} ({symbol})")
+            return
+        try:
+            _call_with_retry(self.exchange.cancel_order, order_id, symbol, max_retries=2)
+        except Exception as exc:  # noqa: BLE001 - stale/already-gone order is not fatal
+            print(f"[CCXT] cancel_stop_loss_order failed for {order_id} ({symbol}): {exc}")
+
+    def fetch_open_stop_orders(self, symbol: str) -> list[dict]:
+        """Reduce-only stop orders currently open on the exchange for
+        ``symbol`` -- used at startup/after a restart (state recovery) to
+        check whether an open position is already protected before assuming
+        it isn't and placing a duplicate. Falls back to an empty list in
+        dry-run mode or on any fetch error (fail-safe: the caller then places
+        a fresh stop rather than leaving a possibly-unprotected position)."""
+        if self.dry_run:
+            return []
+        try:
+            orders = _call_with_retry(self.exchange.fetch_open_orders, symbol)
+        except Exception as exc:  # noqa: BLE001 - never let this crash the live loop
+            print(f"[CCXT] fetch_open_stop_orders failed for {symbol}: {exc} -- assuming none")
+            return []
+        return [
+            o
+            for o in orders
+            if (o.get("type") or "").lower() in ("stop_market", "stop", "stop_loss")
+            and (o.get("reduceOnly") or (o.get("info") or {}).get("reduceOnly"))
+        ]
+
 
 class BinanceFuturesClient(CCXTExchangeClient):
     """Preconfigured client for Binance USDT-M perpetual futures (backward-compat
