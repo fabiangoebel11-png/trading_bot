@@ -12,6 +12,14 @@ with dropout + weight decay -- exactly the "don't memorize the noise" goal.
 trained with label smoothing + AdamW weight decay + gradient clipping + early
 stopping on a held-out validation slice -- every one of these is an explicit
 overfitting guard, not incidental.
+
+Sized for the 1h-native architecture (Session 2026-09-22, "nativ auf 1h
+vereinheitlicht"): ``TrendMLConfig`` defaults now use 6 dilated layers
+(dilations 1,2,4,...,32 -> ~253h/~10.5-day causal receptive field) and a
+128-bar (~5.3-day) input sequence, plus a learned causal attention-pooling
+head (below) instead of reading out only the very last timestep -- deeper
+context matters more once a "bar" means an hour instead of 5 minutes, and
+training compute is a non-issue on the RTX 3070.
 """
 from __future__ import annotations
 
@@ -86,13 +94,25 @@ if nn is not None:
                 in_ch = n_features if i == 0 else hidden_channels
                 blocks.append(_TemporalBlock(in_ch, hidden_channels, kernel_size=3, dilation=2**i, dropout=dropout))
             self.network = nn.Sequential(*blocks)
+            # Causal attention pooling over the full sequence instead of only
+            # reading out the last timestep: every position in ``y`` already
+            # only encodes information up to and including that position (the
+            # TCN's causal padding/chomp guarantees this), so a weighted
+            # average over all of them is still strictly causal -- it just
+            # lets the model learn *which* past regime/lookback horizon
+            # (recent breakout vs. multi-day trend context) is most
+            # informative for the current prediction instead of hard-coding
+            # "only the very last bar matters".
+            self.attn = nn.Linear(hidden_channels, 1)
             self.head = nn.Linear(hidden_channels, 3)
 
         def forward(self, x):  # noqa: ANN001 - x: (batch, seq_len, features)
             x = x.transpose(1, 2)  # -> (batch, features, seq_len) for Conv1d
-            y = self.network(x)
-            last_step = y[:, :, -1]  # causal: last timestep already saw the full receptive field
-            return self.head(last_step)
+            y = self.network(x).transpose(1, 2)  # -> (batch, seq_len, hidden)
+            attn_scores = self.attn(y).squeeze(-1)  # (batch, seq_len)
+            attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1)  # (batch, seq_len, 1)
+            pooled = (y * attn_weights).sum(dim=1)  # (batch, hidden)
+            return self.head(pooled)
 
 
 class TCNTrendModel:
@@ -121,11 +141,18 @@ class TCNTrendModel:
         X_seq: np.ndarray,
         y_seq: np.ndarray,
         val_fraction: float | None = None,
+        sample_weight: np.ndarray | None = None,
     ) -> "TCNTrendModel":
         """``y_seq`` must contain values in {-1, 0, 1}. The tail
         ``val_fraction`` of the (chronologically ordered) input is held out,
         with a ``sequence_length``-wide gap before it, for early stopping --
-        never used for gradient updates."""
+        never used for gradient updates. ``sample_weight`` (same length as
+        ``X_seq``/``y_seq``, e.g. from ``core.ml.dataset.
+        time_decay_sample_weights``) weights each row's contribution to the
+        *training* loss only -- the held-out early-stopping validation loss
+        stays unweighted, since it should reflect plain, undistorted recent
+        performance, not a re-weighted proxy of it.
+        """
         cfg = self.config
         n = X_seq.shape[0]
         if n < 50 or len(np.unique(y_seq)) < 2:
@@ -142,6 +169,11 @@ class TCNTrendModel:
         if len(val_X) == 0:
             val_X, val_y = train_X[-val_size:], train_y[-val_size:]
 
+        if sample_weight is None:
+            train_w = np.ones(train_end, dtype=np.float32)
+        else:
+            train_w = sample_weight[:train_end].astype(np.float32)
+
         # Fit standardization on the training rows only (last timestep of each
         # sequence would double-count overlaps; using all rows of all training
         # sequences is a reasonable, mildly conservative approximation).
@@ -157,11 +189,16 @@ class TCNTrendModel:
 
         self.model = _TCN(self.n_features, cfg.hidden_channels, cfg.num_layers, cfg.dropout).to(self.device)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-        loss_fn = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+        # reduction="none" so each row's loss can be scaled by its time-decay
+        # sample weight before averaging; the validation criterion below stays
+        # a plain (unweighted) mean.
+        train_loss_fn = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing, reduction="none")
+        val_loss_fn = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
         scaler = torch.amp.GradScaler(device=self.device.type, enabled=self.use_amp)
 
         x_train_t = torch.tensor(train_X_norm)
         y_train_t = torch.tensor(train_y_cls)
+        w_train_t = torch.tensor(train_w)
         x_val_t = torch.tensor(val_X_norm, device=self.device)
         y_val_t = torch.tensor(val_y_cls, device=self.device)
 
@@ -177,11 +214,13 @@ class TCNTrendModel:
                 idx = permutation[start : start + batch_size]
                 batch_x = x_train_t[idx].to(self.device, non_blocking=True)
                 batch_y = y_train_t[idx].to(self.device, non_blocking=True)
+                batch_w = w_train_t[idx].to(self.device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
                     logits = self.model(batch_x)
-                    loss = loss_fn(logits, batch_y)
+                    per_sample_loss = train_loss_fn(logits, batch_y)
+                    loss = (per_sample_loss * batch_w).sum() / batch_w.sum().clamp_min(1e-8)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip_norm)
@@ -191,7 +230,7 @@ class TCNTrendModel:
             self.model.eval()
             with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
                 val_logits = self.model(x_val_t)
-                val_loss = loss_fn(val_logits, y_val_t).item()
+                val_loss = val_loss_fn(val_logits, y_val_t).item()
 
             if val_loss < best_val_loss - 1e-4:
                 best_val_loss = val_loss

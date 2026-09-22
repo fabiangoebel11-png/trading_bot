@@ -112,8 +112,15 @@ def load_multi_asset_data(config: DataConfig) -> dict[str, pd.DataFrame]:
     """Load, resample and align OHLC data for every symbol in ``config.symbols``.
 
     Returns one DataFrame per symbol (columns: open, high, low, close), all
-    reindexed onto the intersection of their timestamps so a multi-asset trend
-    portfolio can combine per-symbol returns bar-by-bar without gaps."""
+    reindexed onto the **union** (outer join) of their timestamps -- a
+    "dynamic universe": the combined history reaches back as far as the
+    *oldest* symbol's data allows, instead of being clipped to the youngest
+    symbol's listing date. Symbols with no data yet at a given timestamp
+    (e.g. SOL/USDT before its ~2020-08 listing) get explicit NaN rows there
+    rather than being silently dropped -- ``core/strategy.py`` and
+    ``core/backtester.py`` are responsible for treating those NaNs as "not
+    yet tradable" (flat/excluded from weighting), not for masking them here.
+    """
     raw = {}
     for symbol in config.symbols:
         history = fetch_ohlcv_history(
@@ -126,12 +133,22 @@ def load_multi_asset_data(config: DataConfig) -> dict[str, pd.DataFrame]:
         )
         raw[symbol] = resample_ohlcv(history, config.resample_to) if config.resample_to else history
 
-    common_index = raw[config.symbols[0]].index
+    union_index = raw[config.symbols[0]].index
     for df in raw.values():
-        common_index = common_index.intersection(df.index)
+        union_index = union_index.union(df.index)
+    union_index = union_index.sort_values()
 
-    aligned = {symbol: df.loc[common_index, ["open", "high", "low", "close"]].sort_index() for symbol, df in raw.items()}
+    aligned = {
+        symbol: df.reindex(union_index)[["open", "high", "low", "close"]].sort_index()
+        for symbol, df in raw.items()
+    }
 
     timeframe_label = config.resample_to or config.base_timeframe
-    print(f"✅ Synchronisiert: {len(common_index)} gemeinsame {timeframe_label}-Kerzen über {len(config.symbols)} Symbole.")
+    print(
+        f"✅ Dynamisches Universum (Outer-Join): {len(union_index)} {timeframe_label}-Kerzen "
+        f"von {union_index.min()} bis {union_index.max()} über {len(config.symbols)} Symbole."
+    )
+    for symbol, df in aligned.items():
+        first_valid = df["close"].first_valid_index()
+        print(f"   - {symbol}: erste verfügbare Kerze {first_valid}")
     return aligned

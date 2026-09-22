@@ -249,3 +249,141 @@ def cap_absolute_notional(
     if max_absolute_position_size_usdt is None:
         return notional_usdt
     return min(notional_usdt, max_absolute_position_size_usdt)
+
+
+def total_notional_scale(
+    weights: pd.DataFrame,
+    leverage: pd.DataFrame,
+    capital_usdt_prior: pd.Series,
+    max_total_notional_usdt: float | None,
+) -> pd.Series:
+    """Backtest (vectorized) counterpart to ``cap_total_notional``: a per-bar
+    scale factor in (0, 1] applied uniformly to every symbol's leverage so the
+    SUM of implied notional exposure (``sum(weight * leverage) *
+    capital_usdt_prior``) never exceeds ``max_total_notional_usdt``. Uses the
+    *previous* bar's capital (this bar's capital depends on this bar's
+    leverage -- circular otherwise), same causal pattern as
+    ``absolute_position_leverage_cap``. ``None`` disables the cap (scale=1.0
+    always)."""
+    if max_total_notional_usdt is None:
+        return pd.Series(1.0, index=capital_usdt_prior.index)
+    implied_notional = (weights * leverage).sum(axis=1) * capital_usdt_prior
+    scale = max_total_notional_usdt / implied_notional.replace(0, np.nan)
+    return scale.clip(upper=1.0).fillna(1.0)
+
+
+def cap_total_notional(
+    signed_notionals: dict[str, float], max_total_notional_usdt: float | None
+) -> dict[str, float]:
+    """Hard ceiling on the SUM of every symbol's notional exposure at once
+    (``CapitalConfig.max_total_notional_usdt``), applied AFTER every
+    per-symbol cap: if the combined absolute notional still exceeds the
+    budget, every symbol is scaled down proportionally (never selectively --
+    that would silently change which symbols are traded). ``None`` disables
+    the cap. A no-op if the total is already within budget."""
+    if max_total_notional_usdt is None or not signed_notionals:
+        return dict(signed_notionals)
+    total_abs = sum(abs(v) for v in signed_notionals.values())
+    if total_abs <= max_total_notional_usdt or total_abs == 0:
+        return dict(signed_notionals)
+    scale = max_total_notional_usdt / total_abs
+    return {symbol: value * scale for symbol, value in signed_notionals.items()}
+
+
+def compute_position_score(trend_strength: pd.Series, atr_pct: pd.Series, epsilon: float = 1e-9) -> pd.Series:
+    """Fixed, causal conviction score for ranking simultaneously active
+    symbols (``PositionSelectionConfig``): ``|trend_strength| / max(atr_pct,
+    epsilon)`` -- how strongly the EMA regime filter has diverged, relative to
+    how much volatility it takes to get there. Both inputs are already
+    causal, already-computed columns from ``core.strategy.
+    generate_trend_signals`` (``ema_fast/ema_slow`` divergence and ATR%) --
+    this is purely a ranking of existing signals, not a new indicator."""
+    return trend_strength.abs() / atr_pct.clip(lower=epsilon)
+
+
+def select_top_active_symbols(
+    scores: dict[str, float], active_symbols: set[str], max_active_positions: int | None
+) -> set[str]:
+    """Return the subset of ``active_symbols`` (already non-flat this bar) to
+    actually keep, ranked by ``scores`` descending. ``None``/covering every
+    active symbol is a no-op -- identical to today's trade-everything-active
+    behavior. Ties broken by symbol name for determinism."""
+    if max_active_positions is None or len(active_symbols) <= max_active_positions:
+        return set(active_symbols)
+    ranked = sorted(active_symbols, key=lambda s: (-scores.get(s, 0.0), s))
+    return set(ranked[:max_active_positions])
+
+
+def score_proportional_weights(scores: dict[str, float], selected_symbols: set[str]) -> dict[str, float]:
+    """Weights proportional to conviction score among only the selected
+    symbols (renormalized to sum to 1) -- replaces inverse-leverage weighting
+    when ``PositionSelectionConfig.enabled``: the strongest-scoring symbol
+    gets the largest share of the shared wallet instead of every active
+    symbol splitting it by inverse volatility."""
+    relevant = {s: max(scores.get(s, 0.0), 0.0) for s in selected_symbols}
+    total = sum(relevant.values())
+    if total <= 0:
+        # No usable score (e.g. all exactly zero) -- fall back to an equal
+        # split among the selected symbols rather than dividing by zero.
+        n = len(selected_symbols) or 1
+        return {s: 1.0 / n for s in selected_symbols}
+    return {s: v / total for s, v in relevant.items()}
+
+
+def select_discrete_exchange_leverage(
+    required_leverage: float, available_steps: list[float], risk_leverage_cap: float
+) -> float:
+    """Real exchanges (Bybit/Binance) only allow a discrete set of leverage
+    values per symbol -- the risk engine's vol-targeted leverage (e.g.
+    "2.37x") is never itself a valid exchange setting. Picks the SMALLEST
+    available step that is still >= ``required_leverage`` (just enough margin
+    headroom for the desired notional, not more than needed), but never a
+    step above ``risk_leverage_cap`` even if that means the achievable
+    notional falls short of what was desired (the risk cap is a hard limit,
+    never something a leverage-rounding step is allowed to violate).
+
+    ``available_steps`` must come from the exchange's own market metadata
+    (``CCXTExchangeClient.fetch_leverage_brackets``), never a hardcoded
+    guess -- different symbols/exchanges/margin tiers offer different steps.
+    """
+    if not available_steps:
+        return min(required_leverage, risk_leverage_cap)
+    allowed_steps = sorted(s for s in available_steps if s <= risk_leverage_cap)
+    if not allowed_steps:
+        # Every available step exceeds the risk cap -- use the smallest step
+        # and accept it may be looser than the ideal risk-capped leverage
+        # (still bounded by whatever the caller does with the resulting
+        # leverage, e.g. clamping notional itself).
+        return min(available_steps)
+    covering = [s for s in allowed_steps if s >= required_leverage]
+    return min(covering) if covering else max(allowed_steps)
+
+
+def resolve_shared_wallet_weights(
+    candidates: dict[str, dict], selection_enabled: bool = False, max_active_positions: int | None = None
+) -> dict[str, float]:
+    """Single source of truth for how much of the shared wallet each
+    currently-active symbol gets -- reused identically by real order sizing
+    (``execution/live_trader.py: poll_once``) and both shadow simulators
+    (``execution/live_trader.py: _shared_wallet_leverage``, ``core.ml.shadow.
+    PortfolioShadowSimulator``), so a position-selection variant test can
+    never silently diverge from what real money would actually do.
+
+    ``candidates``: symbol -> {"target_position", "leverage_candidate",
+    "stop_pct", "close", optionally "score"}. Default
+    (``selection_enabled=False``): inverse-leverage weights renormalized
+    across active symbols (today's baseline). When enabled: top-
+    ``max_active_positions`` symbols by conviction score, weighted
+    score-proportionally instead -- see ``PositionSelectionConfig``.
+    """
+    active = {s: c for s, c in candidates.items() if c["target_position"] != 0}
+    if not active:
+        return {}
+    if selection_enabled:
+        scores = {s: c.get("score", 0.0) for s, c in candidates.items()}
+        selected = select_top_active_symbols(scores, set(active), max_active_positions)
+        return score_proportional_weights(scores, selected)
+    weight_sum = sum(c["leverage_candidate"] for c in active.values())
+    if weight_sum <= 0:
+        return {}
+    return {s: c["leverage_candidate"] / weight_sum for s, c in active.items()}

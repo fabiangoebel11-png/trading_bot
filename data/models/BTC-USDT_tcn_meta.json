@@ -36,53 +36,72 @@
     "URTH_ret",
     "URTH_vol20",
     "URTH_zscore60",
+    "macro_data_age_hours",
     "breadth_ret_1",
     "breadth_ret_6",
     "breadth_vol",
     "breadth_zscore",
-    "breadth_corr"
+    "breadth_corr",
+    "htf_4h_ema_regime",
+    "htf_4h_ema_fast_dist",
+    "htf_4h_atr_pct",
+    "htf_4h_donchian_upper_dist",
+    "htf_4h_donchian_lower_dist",
+    "htf_4h_rsi_14",
+    "htf_4h_data_age_hours",
+    "htf_1d_ema_regime",
+    "htf_1d_ema_fast_dist",
+    "htf_1d_atr_pct",
+    "htf_1d_donchian_upper_dist",
+    "htf_1d_donchian_lower_dist",
+    "htf_1d_rsi_14",
+    "htf_1d_data_age_hours"
   ],
-  "sequence_length": 64,
+  "sequence_length": 128,
+  "hidden_channels": 96,
+  "num_layers": 6,
+  "dropout": 0.35,
   "walk_forward_metrics": [
     {
-      "n_test": 48400,
-      "accuracy": 0.47551652892561985,
-      "directional_hit_rate": 0.5007409344490934,
-      "directional_edge": 0.004420740335843694,
+      "n_test": 8671,
+      "accuracy": 0.45392688271248993,
+      "directional_hit_rate": 0.4682926829268293,
+      "directional_edge": -0.05650132801310922,
       "fold": 0,
-      "n_train": 45496
+      "n_train": 8151
     },
     {
-      "n_test": 48400,
-      "accuracy": 0.48074380165289254,
-      "directional_hit_rate": 0.5041289986091794,
-      "directional_edge": 0.027992922839821584,
+      "n_test": 8671,
+      "accuracy": 0.4753776957675009,
+      "directional_hit_rate": 0.5059574990787372,
+      "directional_edge": -0.03701463075260099,
       "fold": 1,
-      "n_train": 93896
+      "n_train": 16822
     },
     {
-      "n_test": 48400,
-      "accuracy": 0.4888636363636364,
-      "directional_hit_rate": 0.5061905885887175,
-      "directional_edge": 0.030462005917261635,
+      "n_test": 8671,
+      "accuracy": 0.47007265597970244,
+      "directional_hit_rate": 0.48714576109051777,
+      "directional_edge": 0.002840217845789167,
       "fold": 2,
-      "n_train": 142296
+      "n_train": 25493
     },
     {
-      "n_test": 48400,
-      "accuracy": 0.46570247933884296,
-      "directional_hit_rate": 0.4937593062976263,
-      "directional_edge": -0.010358796153968376,
+      "n_test": 8671,
+      "accuracy": 0.5290047284050282,
+      "directional_hit_rate": 0.5416420555227407,
+      "directional_edge": 0.05045322457993321,
       "fold": 3,
-      "n_train": 190696
+      "n_train": 34164
     },
     {
-      "n_test": 48403,
-      "accuracy": 0.4816023800177675,
-      "directional_hit_rate": 0.504444009822457,
-      "directional_edge": 0.013029168986423503,
+      "n_test": 8671,
+      "accuracy": 0.5053627032637528,
+      "directional_hit_rate": 0.5190713101160862,
+      "directional_edge": 0.03802945051637599,
       "fold": 4,
-      "n_train": 239096
+      "n_train": 42835
     }
-  ]
+  ],
+  "training_cutoff": "2026-09-18T21:00:00"
 }

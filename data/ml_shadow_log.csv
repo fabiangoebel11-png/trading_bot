@@ -1,0 +1,4 @@
+timestamp,symbol,rule_position,ml_position,ml_confidence,regime,atr,close,rule_cost,ml_cost,rule_pnl,ml_pnl
+2026-09-22T14:00:00,BTC/USDT,1.0,1.0,0.5785536170005798,sideways,559.1949999999987,86258.01,0.0,0.0,0.0,0.0
+2026-09-22T14:00:00,ETH/USDT,1.0,0.0,-0.1672246754169464,sideways,20.877857142857142,2742.73,0.0,0.0,0.0,0.0
+2026-09-22T14:00:00,SOL/USDT,1.0,0.0,-0.2510679364204407,sideways,1.2357142857142855,116.89,0.0,0.0,0.0,0.0

@@ -34,8 +34,8 @@ def triple_barrier_labels(
     that fixes this, the future data simply doesn't exist yet).
 
     Vectorized across the ``horizon`` dimension (one pass per step-ahead
-    offset) rather than per-bar, since a plain Python double loop over ~300k
-    5m bars * 48-bar horizon would be far too slow.
+    offset) rather than per-bar, since a plain Python double loop over tens of
+    thousands of bars * 48-bar horizon would be far too slow.
     """
     n = len(close)
     prices = close.to_numpy(dtype=np.float64)

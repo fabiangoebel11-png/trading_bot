@@ -15,8 +15,9 @@ def main() -> None:
     # 1. Daten auf ca. 5,5 Jahre erweitern, um mehr Marktphasen zu testen
     config.data.history_days = 2500
     
-    # 2. ML-Konfidenz-Filter aktivieren (wird dann in core/strategy.py verarbeitet)
-    config.ml.enabled = True
+    # ML remains disabled for the production candidate: the paired OOS
+    # comparison did not establish a robust Sharpe improvement. Experimental
+    # ML variants are evaluated only through compare_monte_carlo_ml.py.
 
     multi_ohlc = load_multi_asset_data(config.data)
     funding_df = load_portfolio_funding(config.data, config.funding) if config.funding.enabled else None

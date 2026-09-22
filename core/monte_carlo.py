@@ -1,15 +1,24 @@
 """Monte Carlo random-start stress test.
 
 Rather than literally re-running the full walk-forward pipeline N times (the
-hedge ratio / z-score / ML gate are causal and computed once on the full
-history regardless of which sub-window we later score), this module computes
-the full-history backtest exactly once and then resamples ``n_runs`` random
+hedge ratio / z-score gate is causal and computed once on the full history
+regardless of which sub-window we later score), this module computes the
+full-history backtest exactly once and then resamples ``n_runs`` random
 contiguous windows from the resulting daily/intraday return series. For each
 window it computes the standard performance metrics (Sharpe, Sortino, total
 return, max drawdown, profit factor). The resulting distribution answers the
 practical question "does this strategy have an edge regardless of which
 period you happened to start trading it in?" -- which is what a random-start
 Monte Carlo test is meant to probe.
+
+The ML confirmation layer (when ``config.ml.enabled``) is safe to include in
+this single full-history backtest specifically BECAUSE ``core/strategy.py:
+generate_portfolio_signals`` scores every historical bar with the stitched
+*out-of-sample* purged-walk-forward confidence series (``core.ml.inference.
+load_oos_confidence``), not a model trained on the full history -- using the
+latter here would score e.g. a 2020 bar with a model that has already seen
+2024-2026 data, an in-sample leak that silently inflates the Sharpe/Monte-
+Carlo numbers below (found and fixed in a 2026-09-22 audit).
 
 Caveat (documented, not hidden): because windows are drawn from a single
 historical path and heavily overlap for large ``n_runs``, this is an

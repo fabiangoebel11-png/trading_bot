@@ -1,0 +1,6 @@
+{"entries_halted": false, "event": "startup", "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"], "timestamp": "2026-09-22T15:07:30.170077+00:00"}
+{"event": "reconciliation_complete", "reason": "pre_signal_poll", "timestamp": "2026-09-22T15:07:30.171076+00:00"}
+{"daily_loss_pct": 0.0, "drawdown_pct": 0.0, "equity": 500.0, "event": "account_risk_check", "timestamp": "2026-09-22T15:07:30.172055+00:00"}
+{"event": "order_result", "filled_price": 86177.3, "is_maker": true, "order_id": null, "reduce_only": false, "requested_amount": 0.0009636917916007588, "side": "buy", "status": "dry_run", "symbol": "BTC/USDT", "timestamp": "2026-09-22T15:07:46.858658+00:00"}
+{"event": "order_result", "filled_price": 2743.85, "is_maker": true, "order_id": null, "reduce_only": false, "requested_amount": 0.030307808714972368, "side": "buy", "status": "dry_run", "symbol": "ETH/USDT", "timestamp": "2026-09-22T15:07:47.120668+00:00"}
+{"event": "order_result", "filled_price": 116.94, "is_maker": true, "order_id": null, "reduce_only": false, "requested_amount": 0.7111483976115678, "side": "buy", "status": "dry_run", "symbol": "SOL/USDT", "timestamp": "2026-09-22T15:07:47.383640+00:00"}

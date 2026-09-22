@@ -125,40 +125,34 @@ def generate_portfolio_signals(
         for symbol, ohlc in multi_ohlc.items()
     }
 
-    # ML-Konfidenz-Skalierung, falls aktiviert
+    # ML-Konfidenz-Skalierung, falls aktiviert.
+    #
+    # Uses ONLY the stitched, purged-walk-forward out-of-sample confidence
+    # (``core.ml.inference.load_oos_confidence``) -- never the full-history
+    # final model. This function is exclusively the BACKTESTING path
+    # (``core/backtester.py`` is its only caller; live trading goes through
+    # ``execution/live_trader.py``'s own ``_apply_ml_confirmation``, which
+    # correctly uses the final model for genuine prospective inference).
+    # Using the final model here would score e.g. a 2020 bar with a model
+    # that has already seen 2024-2026 data during training -- an in-sample
+    # leak that silently inflates every backtested/Monte-Carlo Sharpe number
+    # (found in a 2026-09-22 audit; see ``core/ml/train.py:
+    # train_symbol_model`` for where the OOS series is produced/saved).
     if full_config is not None and getattr(full_config, "ml", None) and getattr(full_config.ml, "enabled", False):
         try:
-            from core.ml.features import fetch_breadth_basket, fetch_macro_matrix
-            from core.ml.inference import apply_ml_confirmation, load_symbol_model, predict_trend_confidence
+            from core.ml.inference import apply_regime_gated_ml_confirmation, load_oos_confidence
 
-            macro_df = fetch_macro_matrix(full_config.ml)
-            breadth_return = fetch_breadth_basket(full_config.data, full_config.ml)
             for symbol, sig_df in signals_dict.items():
-                try:
-                    model, meta = load_symbol_model(symbol, full_config.ml)
-                    try:
-                        conf = predict_trend_confidence(
-                            sig_df, macro_df, model, meta, full_config.ml, breadth_return
-                        )
-                        signals_dict[symbol] = apply_ml_confirmation(sig_df, conf)
-                        print(f"  [ML] {symbol}: Konfidenz-Filter erfolgreich angewendet.")
-                    finally:
-                        # A fresh TCNTrendModel is instantiated (and moved to the
-                        # GPU) on every call. Explicitly drop the reference and
-                        # release cached CUDA memory now rather than waiting on
-                        # Python's GC, so repeated calls (walk-forward folds,
-                        # Monte Carlo, a future live polling loop) don't let
-                        # reserved VRAM creep up over a long-running process.
-                        del model
-                        try:
-                            import torch
-
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        except ImportError:
-                            pass
-                except FileNotFoundError:
-                    print(f"  [ML] Kein Modell für {symbol} gefunden – nutze rohes Signal.")
+                oos_confidence = load_oos_confidence(symbol, full_config.ml)
+                if oos_confidence is None:
+                    print(
+                        f"  [ML] {symbol}: keine Out-of-Sample-Konfidenz gefunden "
+                        "(noch nicht/veraltet trainiert) -- nutze rohes Signal."
+                    )
+                    continue
+                conf = oos_confidence.reindex(sig_df.index)
+                signals_dict[symbol] = apply_regime_gated_ml_confirmation(sig_df, conf, full_config.ml)
+                print(f"  [ML] {symbol}: Out-of-Sample-Konfidenz (purged walk-forward, leak-frei) angewendet.")
         except Exception as e:
             print(f"  [ML-Warnung] Konfidenz-Skalierung übersprungen: {e}")
 

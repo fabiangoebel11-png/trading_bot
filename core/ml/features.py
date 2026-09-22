@@ -86,6 +86,56 @@ def build_technical_features(ohlc: pd.DataFrame, config: TrendMLConfig) -> pd.Da
     return out
 
 
+def _resample_causal(ohlc: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample 1h OHLC to a coarser bar (e.g. 4h/1d), labeling each row by
+    its CLOSE time (``label='right', closed='right'``) instead of pandas'
+    default bar-*start* labeling. This is the causality-critical bit: a 4h/1d
+    bar's high/low/close only actually exist once that bar has finished
+    forming, so indexing it by the close time means the plain ffill in
+    ``align_macro_to_intraday`` (reused below with zero reporting lag) can
+    never let an hourly bar see a coarser bar before it has actually closed."""
+    return (
+        ohlc.resample(rule, label="right", closed="right")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
+
+
+def build_higher_timeframe_features(ohlc: pd.DataFrame, rule: str, config: TrendMLConfig) -> pd.DataFrame:
+    """Trend/regime context from a coarser resample of the SAME 1h OHLC
+    (e.g. 4h, 1d) -- a classic multi-timeframe CTA technique ("confirm the
+    hourly breakout against the daily trend") added as extra context, not a
+    new tradeable signal. Deliberately reuses the exact same feature formulas
+    and window lengths as ``build_technical_features`` (EMA 20/100 regime,
+    Donchian 55/20 distance, ATR(14)%, RSI(14)) -- only the *resolution*
+    changes (e.g. "EMA 100" on a daily resample is a ~100-day trend filter),
+    so this introduces no new tunable numbers, only new views of already-
+    vetted ones. Column names are prefixed with the rule (e.g. ``htf_4h_``)
+    so the model can tell timeframes apart; still indexed at each coarse
+    bar's own close time -- causal alignment onto the 1h index happens in
+    ``build_feature_matrix`` via the same ``align_macro_to_intraday`` ffill
+    pattern used for macro data (with zero reporting lag, since there is no
+    real-world publication delay for a self-resampled candle)."""
+    coarse = _resample_causal(ohlc, rule)
+    close, high, low = coarse["close"], coarse["high"], coarse["low"]
+    atr = compute_atr(high, low, close, 14)
+    atr_safe = atr.replace(0, np.nan)
+
+    prefix = f"htf_{rule}_"
+    out = pd.DataFrame(index=coarse.index)
+    ema_fast = close.ewm(span=20, adjust=False).mean()
+    ema_slow = close.ewm(span=100, adjust=False).mean()
+    out[f"{prefix}ema_regime"] = np.sign(ema_fast - ema_slow)
+    out[f"{prefix}ema_fast_dist"] = (close - ema_fast) / atr_safe
+    out[f"{prefix}atr_pct"] = atr / close
+
+    upper_entry, lower_entry, _, _ = compute_donchian_channels(high, low, 55, 20)
+    out[f"{prefix}donchian_upper_dist"] = (close - upper_entry) / atr_safe
+    out[f"{prefix}donchian_lower_dist"] = (close - lower_entry) / atr_safe
+    out[f"{prefix}rsi_14"] = compute_rsi(close, 14)
+    return out
+
+
 def _macro_cache_path(config: TrendMLConfig) -> Path:
     tag = "_".join(s.replace("^", "").replace("=", "").replace("/", "-") for s in config.macro_symbols)
     return Path(config.macro_cache_dir) / f"ml_macro_{tag}_{config.macro_lookback_days}d.csv"
@@ -133,15 +183,40 @@ def build_macro_features(macro_prices: pd.DataFrame, config: TrendMLConfig) -> p
 
 
 def align_macro_to_intraday(
-    macro_features_daily: pd.DataFrame, target_index: pd.DatetimeIndex, reporting_lag_days: int
+    macro_features_daily: pd.DataFrame,
+    target_index: pd.DatetimeIndex,
+    reporting_lag_days: int,
+    age_column: str = "macro_data_age_hours",
 ) -> pd.DataFrame:
     """Shift daily macro features forward by the reporting lag, then
     forward-fill onto the intraday index -- an intraday bar only ever sees a
     macro data point that had already closed in the past (identical causality
-    pattern to ``core.macro._align_daily_to_index``)."""
+    pattern to ``core.macro._align_daily_to_index``).
+
+    Also appends ``age_column`` (default ``macro_data_age_hours``): hours
+    elapsed since the last *actual* (non-ffilled) observation. Crypto trades
+    24/7 but the underlying equity-index futures/VIX data only update on US
+    trading days (Problem C: weekend gap) -- plain ffill alone silently
+    presents Saturday's stale Friday-close numbers as if they were fresh.
+    Rather than inventing a new weekend-specific feature/special-case, this
+    single continuous staleness signal lets the model itself learn how much
+    to trust/downweight the ffilled block: it is small and near-constant on a
+    normal weekday (just the reporting lag), and grows to ~48-72h over a
+    weekend/holiday, unifying "weekend", "holiday" and any other data-gap
+    case under one quantitative, causally-computed feature instead of several
+    brittle calendar-rule special cases. This helper is reused for the
+    higher-timeframe features below (``age_column`` given a distinct name per
+    source there) since both share the exact same causal shift+ffill pattern."""
     lagged = macro_features_daily.shift(reporting_lag_days)
     union_index = lagged.index.union(target_index)
-    aligned = lagged.reindex(union_index).ffill().reindex(target_index)
+    reindexed = lagged.reindex(union_index)
+
+    has_data = reindexed.notna().any(axis=1)
+    observation_time = pd.Series(reindexed.index, index=reindexed.index).where(has_data).ffill()
+    age_hours = (pd.Series(reindexed.index, index=reindexed.index) - observation_time).dt.total_seconds() / 3600.0
+
+    aligned = reindexed.ffill().reindex(target_index)
+    aligned[age_column] = pd.Series(age_hours, index=reindexed.index).reindex(target_index)
     return aligned
 
 
@@ -237,4 +312,17 @@ def build_feature_matrix(
     if breadth_return is not None and not breadth_return.empty:
         breadth_features = build_breadth_features(ohlc["close"], breadth_return, config)
         features = features.join(breadth_features)
+    for rule in config.higher_timeframes or []:
+        htf_features = build_higher_timeframe_features(ohlc, rule, config)
+        if htf_features.empty:
+            continue
+        # Zero reporting lag: unlike real-world macro data, a self-resampled
+        # higher-timeframe candle is already indexed at its own close time
+        # (see build_higher_timeframe_features), so the only causality step
+        # needed is the ffill onto the 1h index -- reusing the exact same
+        # helper as the macro alignment keeps this to one code path.
+        htf_aligned = align_macro_to_intraday(
+            htf_features, ohlc.index, reporting_lag_days=0, age_column=f"htf_{rule}_data_age_hours"
+        )
+        features = features.join(htf_aligned)
     return features

@@ -38,10 +38,14 @@ from core.risk import (
     apply_dynamic_stop,
     apply_trade_cooldown,
     cold_start_leverage_scale,
+    compute_position_score,
     dynamic_leverage,
     dynamic_stop_distance,
     risk_based_leverage_cap,
+    score_proportional_weights,
+    select_top_active_symbols,
     shared_wallet_risk_scale,
+    total_notional_scale,
 )
 from core.strategy import generate_portfolio_signals
 
@@ -90,13 +94,45 @@ def _symbol_candidate_frame(
     )
     stop_distance_pct = (stop_distance / close).replace([0, np.inf, -np.inf], np.nan)
 
+    # Ranking score for the opt-in position-selection variant
+    # (PositionSelectionConfig, default disabled) -- purely derived from
+    # already-computed causal columns (EMA regime divergence, ATR%), no new
+    # indicators. Harmless to always compute; only used when enabled.
+    trend_strength = (sig["ema_fast"] / sig["ema_slow"] - 1.0).replace([np.inf, -np.inf], np.nan)
+    atr_pct = (sig["atr"] / close).replace([np.inf, -np.inf], np.nan)
+    score = compute_position_score(trend_strength, atr_pct, config.selection.score_epsilon).fillna(0.0)
+
     out = pd.DataFrame(index=sig.index)
     out["close"] = close
     out["price_return"] = price_returns
     out["execution_position"] = execution_position
     out["leverage_candidate"] = leverage_candidate
     out["stop_distance_pct"] = stop_distance_pct.fillna(0.0)
+    out["score"] = score
     return out
+
+
+def _apply_position_selection(
+    execution_matrix: pd.DataFrame, score_matrix: pd.DataFrame, config: TradingBotConfig
+) -> pd.DataFrame:
+    """Row-wise (bar-by-bar): among symbols with a non-flat ``execution_
+    position`` this bar, keep only the top ``config.selection.
+    max_active_positions`` by conviction score and return SCORE-PROPORTIONAL
+    weights for the kept symbols (0 for everyone else) -- replaces the
+    default inverse-leverage-weighted ``weights_matrix`` when ``config.
+    selection.enabled``. Only ever called when enabled; disabled is a
+    complete no-op elsewhere (see ``run_backtest_from_signals``)."""
+    symbols = list(execution_matrix.columns)
+    weights = pd.DataFrame(0.0, index=execution_matrix.index, columns=symbols)
+    for ts in execution_matrix.index:
+        active = {s for s in symbols if execution_matrix.at[ts, s] != 0}
+        if not active:
+            continue
+        scores = {s: float(score_matrix.at[ts, s]) for s in symbols}
+        selected = select_top_active_symbols(scores, active, config.selection.max_active_positions)
+        for symbol, weight in score_proportional_weights(scores, selected).items():
+            weights.at[ts, symbol] = weight
+    return weights
 
 
 def _finalize_symbol_backtest(
@@ -127,6 +163,7 @@ def _finalize_symbol_backtest(
     result["execution_position"] = execution_position
     result["leverage"] = leverage
     result["trade"] = trade_flag
+    result["fee_cost"] = cost
     result["strategy_return"] = raw_return - cost
     result["cumulative_market"] = (1 + candidate["close"].pct_change().fillna(0)).cumprod()
     result = apply_funding_costs(result, funding_rate, config)
@@ -171,6 +208,13 @@ def _build_portfolio(
 
     returns_matrix = pd.concat({symbol: r["strategy_return"] for symbol, r in per_symbol.items()}, axis=1)
     trades_matrix = pd.concat({symbol: r["trade"] for symbol, r in per_symbol.items()}, axis=1)
+    # Same dynamic-universe NaN-fill as the candidate matrices above: a symbol
+    # not yet listed at a given bar contributes exactly 0 return/trades to the
+    # shared-wallet portfolio sum, instead of NaN silently dropping out of
+    # ``.sum(axis=1, skipna=True)`` in a way that's easy to break by accident
+    # in a future edit.
+    returns_matrix = returns_matrix.fillna(0.0)
+    trades_matrix = trades_matrix.fillna(0.0)
 
     portfolio = pd.DataFrame(index=returns_matrix.index)
     portfolio["strategy_return"] = (returns_matrix * weights_matrix).sum(axis=1)
@@ -183,8 +227,8 @@ def _build_portfolio(
     portfolio["drawdown_usdt"] = capital - capital.cummax()
 
     for symbol, r in per_symbol.items():
-        portfolio[f"{symbol}_position"] = r["execution_position"]
-        portfolio[f"{symbol}_return"] = r["strategy_return"]
+        portfolio[f"{symbol}_position"] = r["execution_position"].reindex(portfolio.index).fillna(0.0)
+        portfolio[f"{symbol}_return"] = r["strategy_return"].reindex(portfolio.index).fillna(0.0)
         portfolio[f"{symbol}_weight"] = weights_matrix[symbol]  # Zum Debuggen der dyn. Gewichtung
 
     return portfolio, per_symbol
@@ -221,6 +265,15 @@ def run_backtest_from_signals(
     execution_matrix = pd.concat({s: c["execution_position"] for s, c in candidates.items()}, axis=1)
     leverage_candidate_matrix = pd.concat({s: c["leverage_candidate"] for s, c in candidates.items()}, axis=1)
     stop_pct_matrix = pd.concat({s: c["stop_distance_pct"] for s, c in candidates.items()}, axis=1)
+    # Dynamic universe: concatenating per-symbol Series with different start
+    # dates (e.g. SOL/USDT listed years after BTC/ETH) produces NaN wherever a
+    # symbol has no data yet. Treat that explicitly as "flat/not tradable" (0)
+    # rather than leaving it NaN -- ``NaN != 0`` is True in pandas, so an
+    # un-filled NaN here would make ``active_mask`` below wrongly count a
+    # not-yet-listed symbol as an open position.
+    execution_matrix = execution_matrix.fillna(0.0)
+    leverage_candidate_matrix = leverage_candidate_matrix.fillna(0.0)
+    stop_pct_matrix = stop_pct_matrix.fillna(0.0)
 
     # --- Konzept 1: capital allocation across simultaneously active coins ---
     # Inverse-leverage weights (calmer/lower-risk symbols get more weight),
@@ -232,6 +285,17 @@ def run_backtest_from_signals(
     active_leverage = leverage_candidate_matrix.where(active_mask, 0.0)
     weight_sum = active_leverage.sum(axis=1)
     weights_matrix = active_leverage.div(weight_sum, axis=0).fillna(0.0)
+
+    # --- Opt-in: conviction-ranked top-N selection instead of trading every
+    # active signal (PositionSelectionConfig, disabled by default -- a no-op
+    # here, ``weights_matrix`` above is left untouched unless a human has
+    # explicitly enabled it after validating it via
+    # research/compare_position_selection.py). Overrides the inverse-leverage
+    # weights above with score-proportional weights among the top-ranked
+    # symbols only.
+    if config.selection.enabled:
+        score_matrix = pd.concat({s: c["score"] for s, c in candidates.items()}, axis=1).fillna(0.0)
+        weights_matrix = _apply_position_selection(execution_matrix, score_matrix, config)
 
     # --- Konzept 2: shared-wallet stop-out risk cap ---
     # Defensive second layer on top of each symbol's already wallet-budgeted
@@ -270,6 +334,18 @@ def run_backtest_from_signals(
     capped_leverage_matrix = final_leverage_matrix.mul(cold_start_scale, axis=0).clip(upper=abs_cap_matrix).clip(
         lower=config.risk.min_leverage
     )
+
+    # --- Hard portfolio-wide notional ceiling (CapitalConfig.
+    # max_total_notional_usdt, None disables it/no-op): applied after every
+    # per-symbol cap, scales ALL symbols down uniformly if the combined
+    # notional would still exceed the budget -- selection/ranking above must
+    # never be able to raise this, only ever change which symbols compete for
+    # the same already-capped budget. ---
+    notional_scale = total_notional_scale(
+        weights_matrix, capped_leverage_matrix, prior_capital, config.capital.max_total_notional_usdt
+    )
+    capped_leverage_matrix = capped_leverage_matrix.mul(notional_scale, axis=0).clip(lower=config.risk.min_leverage)
+
     implied_portfolio_risk_capped = (
         weights_matrix * capped_leverage_matrix * stop_pct_matrix
     ).sum(axis=1)
@@ -295,4 +371,50 @@ def run_backtest(
 ) -> pd.DataFrame:
     signals = prepare_signals(multi_ohlc, config, macro_df)
     return run_backtest_from_signals(signals, config, funding_df)
+
+
+def run_rule_vs_ml_backtest(
+    multi_ohlc: dict[str, pd.DataFrame],
+    config: TradingBotConfig,
+    macro_df: pd.DataFrame | None = None,
+    funding_df: dict[str, pd.Series] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Paired backtest for the ML shadow-mode audit (``core/ml/shadow.py``):
+    runs the rule-only strategy and the OOS-ML-confirmed strategy through the
+    exact same ``prepare_signals``/``run_backtest_from_signals`` code path --
+    identical macro gate, ATR stop, cooldown, execution latency, funding cost
+    and shared-wallet leverage/risk-scaling logic for both. The two runs
+    differ ONLY in ``generate_portfolio_signals``'s ML confirmation block
+    (``config.ml.enabled``); everything downstream of that is byte-identical
+    code, not a re-implementation, so the resulting per-symbol
+    ``strategy_return`` is a fair like-for-like comparison instead of the
+    simplified, leverage=1/no-macro/no-funding standalone calculation in
+    ``core.ml.shadow.build_shadow_log``.
+
+    ``macro_df``/``funding_df`` are computed once (if not passed in) and
+    reused for both runs so neither variant can drift from a fresh fetch the
+    other didn't get.
+    """
+    import copy
+
+    rule_config = copy.deepcopy(config)
+    rule_config.ml.enabled = False
+    ml_config = copy.deepcopy(config)
+    ml_config.ml.enabled = True
+
+    if macro_df is None and config.macro.enabled:
+        from core.macro import fetch_macro_data
+
+        macro_df = fetch_macro_data(config.macro)
+    if funding_df is None and config.funding.enabled:
+        from core.funding import load_portfolio_funding
+
+        funding_df = load_portfolio_funding(config.data, config.funding)
+
+    rule_signals = prepare_signals(multi_ohlc, rule_config, macro_df)
+    ml_signals = prepare_signals(multi_ohlc, ml_config, macro_df)
+
+    portfolio_rule = run_backtest_from_signals(rule_signals, rule_config, funding_df)
+    portfolio_ml = run_backtest_from_signals(ml_signals, ml_config, funding_df)
+    return portfolio_rule, portfolio_ml
 

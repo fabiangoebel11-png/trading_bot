@@ -89,3 +89,30 @@ def build_row_level_dataset(
     t1_pos = combined.index.get_indexer(combined["t1"], method="bfill")
     t1_pos = np.where(t1_pos < 0, len(combined) - 1, t1_pos)
     return X, y, t1_pos.astype(np.int64)
+
+
+def time_decay_sample_weights(timestamps: pd.DatetimeIndex, half_life_days: float | None) -> np.ndarray:
+    """Exponential recency weighting for the training loss: ``weight = 0.5 **
+    (age_days / half_life_days)``, where ``age_days`` is measured from the
+    *most recent* timestamp in ``timestamps`` (i.e. relative to whatever slice
+    of history is being fit, not wall-clock "today"). Standard non-stationary-
+    market practice (recency weighting is common in quant/HFT covariance and
+    signal estimation) -- lets a widened training window span multiple market
+    regimes (e.g. the 2020/2021 bull) without that older, structurally
+    different microstructure dominating the gradient signal over the current
+    regime.
+
+    Deliberately a function of *time only* -- never of the realized label,
+    return, or direction -- so a bull-market bar and a bear-market bar of the
+    same age get exactly the same weight. That symmetry is intentional: this
+    is recency weighting, not "weight profitable regimes higher" (which would
+    be look-ahead/profit-fitting, not a real training technique).
+
+    Returns an all-ones array (uniform weighting, i.e. a no-op) if
+    ``half_life_days`` is ``None``/``0``.
+    """
+    if not half_life_days:
+        return np.ones(len(timestamps), dtype=np.float64)
+    reference = timestamps.max()
+    age_days = (reference - timestamps).total_seconds() / 86400.0
+    return np.exp(-np.log(2.0) * age_days / half_life_days)

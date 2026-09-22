@@ -21,7 +21,7 @@ import pandas as pd
 
 from core.config import DataConfig, TradingBotConfig, TrendMLConfig
 from core.data_loader import fetch_ohlcv_history
-from core.ml.dataset import build_row_level_dataset, make_sequences, purged_walk_forward_splits
+from core.ml.dataset import build_row_level_dataset, make_sequences, purged_walk_forward_splits, time_decay_sample_weights
 from core.ml.features import build_feature_matrix, fetch_breadth_basket, fetch_macro_matrix
 from core.ml.labeling import triple_barrier_labels
 from core.ml.tcn_model import TCNTrendModel
@@ -30,8 +30,9 @@ from core.strategy import compute_atr
 
 def load_ml_ohlc(data_config: DataConfig, ml_config: TrendMLConfig) -> dict[str, pd.DataFrame]:
     """Like ``core.data_loader.load_multi_asset_data``, but at the ML pipeline's
-    own (typically finer, noisier) timeframe/history length, and keeping the
-    ``volume`` column that the equal-weight portfolio loader drops."""
+    own timeframe/history length (now the same 1h as the rule-based strategy,
+    see ``TrendMLConfig`` docstring), and keeping the ``volume`` column that
+    the equal-weight portfolio loader drops."""
     raw = {}
     for symbol in data_config.symbols:
         history = fetch_ohlcv_history(
@@ -115,51 +116,83 @@ def train_symbol_model(
 ) -> dict:
     print(f"\n=== {symbol}: building features + triple-barrier labels ===")
     X, y, t1_pos = _prepare_symbol_dataset(ohlc, macro_prices, config, breadth_return)
-    X_seq, y_seq, t1_seq, _index_seq = _to_sequences(X, y, t1_pos, config.sequence_length)
+    X_seq, y_seq, t1_seq, index_seq = _to_sequences(X, y, t1_pos, config.sequence_length)
     print(
         f"{symbol}: {X_seq.shape[0]} sequences, {X_seq.shape[2]} features, "
         f"label distribution: {pd.Series(y_seq).value_counts().to_dict()}"
     )
 
+    # Time-decay training-loss weights (see core/ml/dataset.py:
+    # time_decay_sample_weights): computed once from the full sequence index
+    # so every fold's train slice is weighted consistently by the same
+    # recency curve, then sliced identically to X_seq/y_seq per fold/final fit.
+    sample_weight = time_decay_sample_weights(index_seq, config.sample_weight_half_life_days)
+
     folds = purged_walk_forward_splits(len(y_seq), t1_seq, config.n_splits, config.embargo_fraction)
 
     fold_metrics = []
+    # Stitched, genuinely out-of-sample confidence for every bar covered by a
+    # test fold (NaN elsewhere, e.g. the very first training-only slice before
+    # any fold starts) -- this, NOT the final full-history model below, is
+    # what a backtest/Monte Carlo is allowed to use to score historical bars
+    # without leaking future training data into the past (see
+    # ``core/ml/inference.py: load_oos_confidence`` / ``core/strategy.py:
+    # generate_portfolio_signals``).
+    oos_confidence = np.full(len(y_seq), np.nan, dtype=np.float64)
     for i, fold in enumerate(folds):
         if len(fold.train_idx) < 200 or len(fold.test_idx) == 0:
             print(f"  fold {i}: skipped (too little purged training data)")
             continue
         model = TCNTrendModel(config, n_features=X_seq.shape[2])
-        model.fit(X_seq[fold.train_idx], y_seq[fold.train_idx])
+        model.fit(X_seq[fold.train_idx], y_seq[fold.train_idx], sample_weight=sample_weight[fold.train_idx])
         proba = model.predict_proba(X_seq[fold.test_idx])
         metrics = evaluate_predictions(proba, y_seq[fold.test_idx])
         metrics["fold"] = i
         metrics["n_train"] = int(len(fold.train_idx))
         fold_metrics.append(metrics)
         print(f"  fold {i}: {metrics}")
+        oos_confidence[fold.test_idx] = proba[:, 2] - proba[:, 0]
 
     metrics_df = pd.DataFrame(fold_metrics)
 
     print(f"{symbol}: fitting final model on full history (tail slice held out for early stopping)...")
     final_model = TCNTrendModel(config, n_features=X_seq.shape[2])
-    final_model.fit(X_seq, y_seq)
+    final_model.fit(X_seq, y_seq, sample_weight=sample_weight)
 
     model_dir = Path(config.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     safe_symbol = symbol.replace("/", "-")
     artifact_path = model_dir / f"{safe_symbol}_tcn.pt"
     meta_path = model_dir / f"{safe_symbol}_tcn_meta.json"
+    oos_confidence_path = model_dir / f"{safe_symbol}_tcn_oos_confidence.csv"
 
     import torch  # local import: optional dependency, only needed to persist the model
 
     torch.save(final_model.state_dict(), artifact_path)
+    pd.Series(oos_confidence, index=index_seq, name="oos_confidence").to_frame().to_csv(oos_confidence_path)
     meta = {
         "symbol": symbol,
         "feature_columns": list(X.columns),
         "sequence_length": config.sequence_length,
+        # Architecture hyperparameters actually used to train THIS checkpoint
+        # -- persisted so ``core/ml/inference.py: load_symbol_model`` can
+        # reconstruct the exact same layer shapes later even if
+        # ``TrendMLConfig.hidden_channels``/``num_layers``/``dropout`` are
+        # retuned afterwards (otherwise ``load_state_dict`` fails with a
+        # shape mismatch on every previously trained checkpoint).
+        "hidden_channels": config.hidden_channels,
+        "num_layers": config.num_layers,
+        "dropout": config.dropout,
         "walk_forward_metrics": fold_metrics,
+        # Last timestamp actually used to fit/select this artifact -- the
+        # chronological holdout gate (core/ml/holdout.py, core/ml/promotion.py)
+        # requires that ONLY bars strictly after this cutoff decide production
+        # promotion, since anything up to and including it may have informed
+        # training or hyperparameter/architecture choices.
+        "training_cutoff": index_seq[-1].isoformat(),
     }
     meta_path.write_text(json.dumps(meta, indent=2, default=float))
-    print(f"{symbol}: saved model -> {artifact_path}, metadata -> {meta_path}")
+    print(f"{symbol}: saved model -> {artifact_path}, metadata -> {meta_path}, OOS confidence -> {oos_confidence_path}")
 
     return {"symbol": symbol, "fold_metrics": metrics_df, "artifact_path": str(artifact_path)}
 
