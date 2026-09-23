@@ -1,0 +1,67 @@
+{
+  "seed": 42,
+  "data": {
+    "symbols": ["BTC/USDT", "ETH/USDT"],
+    "base_timeframe": "5m",
+    "history_days": 2500
+    ,"twelve_data": {"enabled": true, "api_key_env": "TWELVE_DATA_API_KEY", "max_requests_per_day": 800, "max_requests_per_minute": 8, "safe_requests_per_minute": 7, "primary_interval": "5min", "derive_higher_timeframes": true, "max_retries": 3, "request_timeout_s": 30}
+  },
+  "ml": {
+    "enabled": true,
+    "assets": ["NASDAQ100_PROXY", "SP500_PROXY", "BTC/USDT", "ETH/USDT"],
+    "optional_assets": ["DAX"],
+    "market_assets": {
+      "NASDAQ100_PROXY": {"provider": "yfinance", "provider_by_timeframe": {"5m": "twelve_data", "1d": "yfinance"}, "provider_symbols": {"twelve_data": "QQQ", "yfinance": "QQQ"}, "symbol": "QQQ", "logical_market": "NASDAQ100", "proxy_of": "QQQ", "derive_from": "5m", "market_type": "equity_index", "session_timezone": "America/New_York"},
+      "SP500_PROXY": {"provider": "yfinance", "provider_by_timeframe": {"5m": "twelve_data", "1d": "yfinance"}, "provider_symbols": {"twelve_data": "SPY", "yfinance": "SPY"}, "symbol": "SPY", "logical_market": "SP500", "proxy_of": "SPY", "derive_from": "5m", "market_type": "equity_index", "session_timezone": "America/New_York"},
+      "DAX": {"provider": "yfinance", "provider_symbols": {"yfinance": "^GDAXI"}, "symbol": "^GDAXI", "logical_market": "DAX", "market_type": "equity_index", "session_timezone": "Europe/Berlin"},
+      "BTC/USDT": {"provider": "ccxt", "symbol": "BTC/USDT", "derive_from": "5m", "market_type": "swap"},
+      "ETH/USDT": {"provider": "ccxt", "symbol": "ETH/USDT", "derive_from": "5m", "market_type": "swap"}
+    },
+    "context_assets": {
+      "VIX": {"provider": "yfinance", "symbol": "^VIX", "market_type": "equity_index"},
+      "US10Y": {"provider": "yfinance", "symbol": "^TNX", "market_type": "rate"},
+      "EURUSD": {"provider": "yfinance", "symbol": "EURUSD=X", "market_type": "fx"},
+      "GOLD": {"provider": "yfinance", "symbol": "GC=F", "market_type": "commodity"},
+      "WTI": {"provider": "yfinance", "symbol": "CL=F", "market_type": "commodity"},
+      "DAX": {"provider": "yfinance", "symbol": "^GDAXI", "market_type": "equity_index"}
+    },
+    "market_cache_dir": "data/market",
+    "timeframe_history_days": {"5m": 1095, "15m": 1825, "1h": 3650, "4h": 5475, "1d": 14600},
+    "context_timeframes": ["1d"],
+    "allow_history_shortfall": true,
+    "timeframes": ["5m", "15m", "1h", "4h", "1d"],
+    "base_timeframe": "5m",
+    "higher_timeframes": ["15m", "1h", "4h", "1d"],
+    "label_horizon": 72,
+    "stop_atr_multiple": 2.0,
+    "take_profit_atr_multiple": 2.0,
+    "sequence_length": 128,
+    "n_splits": 5,
+    "random_state": 42,
+    "model_dir": "data/models",
+    "calibration_method": "temperature",
+    "baseline_logistic_enabled": true,
+    "baseline_gradient_boosting_enabled": true,
+    "score_thresholds": [80.0, 90.0],
+    "train_end": "2024-12-31 23:59:59",
+    "validation_start": "2025-01-01 00:00:00",
+    "validation_end": "2025-12-31 23:59:59",
+    "test_start": "2026-01-01 00:00:00",
+    "test_end": null,
+    "purge_hours": 6,
+    "use_asset_specific_train_start": true,
+    "use_latest_available_test_end": true,
+    "minimum_train_samples": 1000,
+    "minimum_validation_samples": 100,
+    "minimum_test_samples": 100,
+    "shadow_start": "2026-01-01"
+    ,"opportunity_loss_weight": 2.0
+    ,"return_loss_weight": 1.5
+    ,"duration_loss_weight": 0.25
+    ,"mfe_loss_weight": 1.0
+    ,"mae_loss_weight": 1.0
+    ,"direction_loss_weight": 0.25
+    ,"return_target_scale": 0.01
+    ,"excursion_target_scale": 0.01
+  }
+}

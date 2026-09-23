@@ -21,9 +21,13 @@ def get_device(prefer_cuda: bool = True):
     fixed-shape LSTM batches used here (safe win on a single dedicated GPU)."""
     if torch is None:
         raise ImportError("PyTorch is not installed. Run `uv sync --extra ml`.")
-    if prefer_cuda and torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        return torch.device("cuda")
+    if prefer_cuda:
+        try:
+            if torch.cuda.is_available():
+                torch.backends.cudnn.benchmark = True
+                return torch.device("cuda")
+        except Exception:  # noqa: BLE001 - broken/missing CUDA must degrade to CPU
+            pass
     return torch.device("cpu")
 
 

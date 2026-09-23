@@ -28,6 +28,10 @@ def _default_model_dir() -> str:
     return str(_PROJECT_ROOT / "data" / "models")
 
 
+def _default_market_cache_dir() -> str:
+    return str(_PROJECT_ROOT / "data" / "market")
+
+
 def _default_monte_carlo_dir() -> str:
     return str(_PROJECT_ROOT / "data" / "monte_carlo")
 
@@ -60,6 +64,17 @@ class DataConfig:
     resample_to: str | None = None  # optional further downsample, e.g. "4h"
     history_days: int = 2500  # >= 3 years
     cache_dir: str = field(default_factory=_default_data_dir)
+    twelve_data: dict[str, object] = field(default_factory=lambda: {
+        "enabled": True,
+        "api_key_env": "TWELVE_DATA_API_KEY",
+        "max_requests_per_day": 800,
+        "max_requests_per_minute": 8,
+        "safe_requests_per_minute": 7,
+        "primary_interval": "5min",
+        "derive_higher_timeframes": True,
+        "max_retries": 3,
+        "request_timeout_s": 30,
+    })
 
     def __post_init__(self) -> None:
         if len(self.symbols) > 3:
@@ -282,7 +297,7 @@ class TrendMLConfig:
     """
 
     enabled: bool = False
-    base_timeframe: str = "1h"  # unified with DataConfig.base_timeframe -- see class docstring
+    base_timeframe: str = "5m"  # primary prediction timeframe; higher frames are context
     # Raised from 1095 to match DataConfig's 2500-day cap: ``core/ml/train.py:
     # load_ml_ohlc`` intersects all 3 symbols' timestamps, so this is only an
     # upper bound -- it naturally truncates to SOL/USDT's real listing date
@@ -293,7 +308,9 @@ class TrendMLConfig:
     history_days: int = 2500
 
     # Cross-asset macro context, causally lagged (see core/ml/features.py).
-    macro_symbols: list[str] = field(default_factory=lambda: ["ES=F", "NQ=F", "^VIX", "URTH"])
+    macro_symbols: list[str] = field(
+        default_factory=lambda: ["^VIX", "^TNX", "EURUSD=X", "GC=F", "CL=F", "^GDAXI"]
+    )
     # Must cover at least as much history as ``history_days`` above -- was
     # left at 1095 while ``history_days`` was raised to 2500 (Teil 5),
     # exactly the same class of bug already fixed once for the rule-based
@@ -330,7 +347,7 @@ class TrendMLConfig:
     # already in hand. Reuses the exact same EMA/Donchian/ATR/RSI window
     # lengths as the 1h technical features (no new tunable numbers, just new
     # resolutions of already-vetted ones -- see the feature-builder docstring).
-    higher_timeframes: list[str] = field(default_factory=lambda: ["4h", "1d"])
+    higher_timeframes: list[str] = field(default_factory=lambda: ["15m", "1h", "4h", "1d"])
 
     # Cross-coin systemic-noise context ("rest of the crypto market" proxy).
     # TOTAL2/TOTAL3 market-cap indices are not available via ccxt/yfinance, so
@@ -360,6 +377,82 @@ class TrendMLConfig:
     # touch outcome; compute cost is irrelevant per user direction).
     label_horizon: int = 72
     barrier_atr_multiple: float = 2.0
+    stop_atr_multiple: float = 2.0
+    take_profit_atr_multiple: float = 2.0
+    opportunity_loss_weight: float = 1.0
+    return_loss_weight: float = 1.0
+    duration_loss_weight: float = 0.25
+    mfe_loss_weight: float = 0.25
+    mae_loss_weight: float = 0.25
+    direction_loss_weight: float = 1.0
+    return_target_scale: float = 1.0
+    excursion_target_scale: float = 1.0
+    collapse_warning_fraction: float = 0.98
+    assets: list[str] = field(default_factory=lambda: ["NASDAQ100_PROXY", "SP500_PROXY", "BTC/USDT", "ETH/USDT"])
+    optional_assets: list[str] = field(default_factory=lambda: ["DAX"])
+    asset_providers: dict[str, str] = field(
+        default_factory=lambda: {
+            "NASDAQ-100": "yfinance",
+            "S&P 500": "yfinance",
+            "DAX": "yfinance",
+            "BTC/USDT": "ccxt",
+            "ETH/USDT": "ccxt",
+        }
+    )
+    market_assets: dict[str, dict[str, object]] = field(
+        default_factory=lambda: {
+            "NASDAQ-100": {"provider": "yfinance", "symbol": "^NDX", "provider_symbols": {"eodhd": "NDX.INDX"}, "market_type": "equity_index"},
+            "S&P 500": {"provider": "yfinance", "symbol": "^GSPC", "provider_symbols": {"eodhd": "GSPC.INDX"}, "market_type": "equity_index"},
+            "DAX": {"provider": "yfinance", "symbol": "^GDAXI", "provider_symbols": {"eodhd": "GDAXI.INDX"}, "market_type": "equity_index"},
+            "BTC/USDT": {"provider": "ccxt", "symbol": "BTC/USDT", "market_type": "swap"},
+            "ETH/USDT": {"provider": "ccxt", "symbol": "ETH/USDT", "market_type": "swap"},
+        }
+    )
+    context_assets: dict[str, dict[str, object]] = field(
+        default_factory=lambda: {
+            "VIX": {"provider": "yfinance", "symbol": "^VIX", "market_type": "equity_index"},
+            "US10Y": {"provider": "yfinance", "symbol": "^TNX", "market_type": "rate"},
+            "EURUSD": {"provider": "yfinance", "symbol": "EURUSD=X", "market_type": "fx"},
+            "GOLD": {"provider": "yfinance", "symbol": "GC=F", "market_type": "commodity"},
+            "WTI": {"provider": "yfinance", "symbol": "CL=F", "market_type": "commodity"},
+        }
+    )
+    market_cache_dir: str = field(default_factory=_default_market_cache_dir)
+    timeframe_history_days: dict[str, int] = field(
+        default_factory=lambda: {"5m": 1095, "15m": 1825, "1h": 3650, "4h": 5475, "1d": 14600}
+    )
+    context_timeframes: list[str] = field(default_factory=lambda: ["1d"])
+    allow_history_shortfall: bool = True
+    timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h", "1d"])
+    feature_columns: list[str] | None = None
+    mfe_loss_weight: float = 1.0
+    mae_loss_weight: float = 1.0
+    class_weight_mode: str = "balanced"
+    focal_gamma: float = 2.0
+    entry_quality_mode: str = "payoff"
+    entry_quality_loss_weight: float = 1.0
+    optimizer: str = "adamw"
+    scheduler: str | None = None
+    kernel_size: int = 3
+    calibration_method: str | None = "temperature"
+    model_profile: str = "mixed_asset_intraday"
+    relative_return_centering: bool = True
+    baseline_logistic_enabled: bool = True
+    baseline_gradient_boosting_enabled: bool = True
+    score_thresholds: list[float] = field(default_factory=lambda: [80.0, 90.0])
+    train_end: str = "2024-12-31 23:59:59"
+    validation_start: str = "2025-01-01 00:00:00"
+    validation_end: str = "2025-12-31 23:59:59"
+    test_start: str = "2026-01-01 00:00:00"
+    test_end: str | None = None
+    purge_hours: int = 6
+    use_asset_specific_train_start: bool = True
+    use_latest_available_test_end: bool = True
+    minimum_train_samples: int = 1000
+    minimum_validation_samples: int = 100
+    minimum_test_samples: int = 100
+    shadow_start: str = "2026-01-01"
+    walk_forward_windows: list[dict[str, str]] = field(default_factory=list)
 
     # Model / training -- retuned specifically for 1h-native execution
     # (previously 5m-era defaults, see module docstring in core/ml/tcn_model.py).
@@ -372,7 +465,7 @@ class TrendMLConfig:
     dropout: float = 0.35  # slightly higher than the 5m-era 0.3: a deeper/wider net needs more regularization
     weight_decay: float = 1e-4
     learning_rate: float = 1e-3
-    batch_size: int = 256
+    batch_size: int = 4096
     max_epochs: int = 100  # training time is not a constraint (RTX 3070); early stopping still governs actual length
     early_stopping_patience: int = 10  # a deeper network converges/plateaus more slowly than the old 4-layer net
     val_fraction: float = 0.15  # tail slice of each fold's train split, used only for early stopping
@@ -444,6 +537,35 @@ class TrendMLConfig:
 
 
 @dataclass
+class SwingMLConfig:
+    """Independent daily-primary multi-resolution swing model configuration."""
+
+    enabled: bool = True
+    assets: list[str] = field(default_factory=lambda: ["QQQ", "SPY"])
+    market_cache_dir: str = field(default_factory=_default_market_cache_dir)
+    model_dir: str = field(default_factory=lambda: str(_PROJECT_ROOT / "models" / "checkpoints"))
+    daily_lookback: int = 90
+    intraday_lookback_1h: int = 48
+    intraday_lookback_5m: int = 48
+    target_horizons: list[int] = field(default_factory=lambda: [1, 3, 5, 10, 20])
+    batch_size: int = 256
+    learning_rate: float = 1e-3
+    epochs: int = 30
+    dropout: float = 0.2
+    hidden_dimensions: list[int] = field(default_factory=lambda: [128, 64])
+    swing_score_weight: float = 0.70
+    entry_score_weight: float = 0.30
+    max_model2_leverage: float = 10.0
+    validation_fraction: float = 0.15
+    test_fraction: float = 0.15
+    purge_days: int = 20
+    feature_version: str = "swing-v1"
+    target_version: str = "swing-targets-v1"
+    macro_reporting_lag_days: int = 1
+    macro_symbols: list[str] = field(default_factory=lambda: ["^VIX", "^TNX", "EURUSD=X", "GC=F", "CL=F", "^GDAXI"])
+
+
+@dataclass
 class CapitalConfig:
     """Money management for a single **shared** wallet traded across up to 3
     coins simultaneously (not 3 independent sub-accounts): simulates trading a
@@ -511,5 +633,6 @@ class TradingBotConfig:
     walk_forward: WalkForwardConfig = field(default_factory=WalkForwardConfig)
     monte_carlo: MonteCarloConfig = field(default_factory=MonteCarloConfig)
     ml: TrendMLConfig = field(default_factory=TrendMLConfig)
+    swing: SwingMLConfig = field(default_factory=SwingMLConfig)
     selection: PositionSelectionConfig = field(default_factory=PositionSelectionConfig)
 

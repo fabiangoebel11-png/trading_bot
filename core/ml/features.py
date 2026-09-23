@@ -94,8 +94,9 @@ def _resample_causal(ohlc: pd.DataFrame, rule: str) -> pd.DataFrame:
     forming, so indexing it by the close time means the plain ffill in
     ``align_macro_to_intraday`` (reused below with zero reporting lag) can
     never let an hourly bar see a coarser bar before it has actually closed."""
+    pandas_rule = {"5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1D"}.get(rule, rule)
     return (
-        ohlc.resample(rule, label="right", closed="right")
+        ohlc.resample(pandas_rule, label="right", closed="right")
         .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
         .dropna()
     )
@@ -207,16 +208,25 @@ def align_macro_to_intraday(
     brittle calendar-rule special cases. This helper is reused for the
     higher-timeframe features below (``age_column`` given a distinct name per
     source there) since both share the exact same causal shift+ffill pattern."""
-    lagged = macro_features_daily.shift(reporting_lag_days)
-    union_index = lagged.index.union(target_index)
+    # Normalize both sides before any union/reindex operation. Mixing a naive
+    # DatetimeIndex with a timezone-aware one can make pandas construct an
+    # object/ndarray-backed index, which breaks timedelta arithmetic and can
+    # also produce positional rather than timestamp alignment.
+    macro = macro_features_daily.copy()
+    macro.index = pd.DatetimeIndex(pd.to_datetime(macro.index, utc=True))
+    target = pd.DatetimeIndex(pd.to_datetime(target_index, utc=True))
+    lagged = macro.sort_index().shift(reporting_lag_days)
+    union_index = lagged.index.union(target).sort_values()
     reindexed = lagged.reindex(union_index)
 
     has_data = reindexed.notna().any(axis=1)
-    observation_time = pd.Series(reindexed.index, index=reindexed.index).where(has_data).ffill()
-    age_hours = (pd.Series(reindexed.index, index=reindexed.index) - observation_time).dt.total_seconds() / 3600.0
+    timeline = pd.Series(union_index, index=union_index, dtype="datetime64[ns, UTC]")
+    observation_time = timeline.where(has_data).ffill()
+    age_hours = (timeline - observation_time).dt.total_seconds() / 3600.0
 
-    aligned = reindexed.ffill().reindex(target_index)
-    aligned[age_column] = pd.Series(age_hours, index=reindexed.index).reindex(target_index)
+    aligned = reindexed.ffill().reindex(target)
+    aligned[age_column] = age_hours.reindex(target).to_numpy()
+    aligned.index = pd.DatetimeIndex(pd.to_datetime(target_index, utc=True))
     return aligned
 
 
@@ -280,7 +290,11 @@ def build_breadth_features(close: pd.Series, breadth_return: pd.Series, config: 
     if breadth_return.empty:
         return pd.DataFrame(index=close.index)
 
-    aligned = breadth_return.reindex(close.index).ffill()
+    breadth = breadth_return.copy()
+    breadth.index = pd.DatetimeIndex(pd.to_datetime(breadth.index, utc=True))
+    close_index = pd.DatetimeIndex(pd.to_datetime(close.index, utc=True))
+    aligned = breadth.sort_index().reindex(close_index).ffill()
+    aligned.index = close_index
     out = pd.DataFrame(index=close.index)
     out["breadth_ret_1"] = aligned
     out["breadth_ret_6"] = aligned.rolling(6).sum()
@@ -290,7 +304,9 @@ def build_breadth_features(close: pd.Series, breadth_return: pd.Series, config: 
     roll_std = aligned.rolling(config.breadth_zscore_window).std().replace(0, np.nan)
     out["breadth_zscore"] = (aligned - roll_mean) / roll_std
 
-    symbol_log_ret = np.log(close / close.shift(1))
+    symbol_close = close.copy()
+    symbol_close.index = close_index
+    symbol_log_ret = np.log(symbol_close / symbol_close.shift(1))
     out["breadth_corr"] = symbol_log_ret.rolling(config.breadth_corr_window).corr(aligned)
     return out
 

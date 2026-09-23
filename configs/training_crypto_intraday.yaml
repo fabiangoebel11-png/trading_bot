@@ -1,0 +1,33 @@
+{
+  "data": {
+    "symbols": ["BTC/USDT", "ETH/USDT"],
+    "market_type": "spot",
+    "base_timeframe": "5m"
+  },
+  "ml": {
+    "enabled": true,
+    "assets": ["BTC/USDT", "ETH/USDT"],
+    "optional_assets": [],
+    "market_cache_dir": "data/market_crypto_2017",
+    "model_dir": "data/models/model1a_crypto",
+    "base_timeframe": "5m",
+    "history_days": 4000,
+    "timeframe_history_days": {"5m": 4000, "15m": 4000, "1h": 4000, "4h": 4000, "1d": 4000},
+    "timeframes": ["5m", "15m", "1h", "4h", "1d"],
+    "higher_timeframes": ["15m", "1h", "4h", "1d"],
+    "market_assets": {
+      "BTC/USDT": {"provider": "ccxt", "symbol": "BTC/USDT", "market_type": "spot", "history_start": "2017-08-17"},
+      "ETH/USDT": {"provider": "ccxt", "symbol": "ETH/USDT", "market_type": "spot", "history_start": "2017-08-17"}
+    },
+    "context_assets": {},
+    "macro_symbols": [],
+    "breadth_enabled": false,
+    "class_weight_mode": "balanced",
+    "model_profile": "crypto_intraday",
+    "train_end": "2024-12-31 23:59:59",
+    "validation_start": "2025-01-01 00:00:00",
+    "validation_end": "2025-12-31 23:59:59",
+    "test_start": "2026-01-01 00:00:00",
+    "test_end": null
+  }
+}

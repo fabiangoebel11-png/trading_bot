@@ -13,6 +13,15 @@ import pandas as pd
 
 from core.config import RiskConfig
 
+ABSOLUTE_MODEL2_LEVERAGE_CAP = 10.0
+
+
+def cap_model2_leverage(value: float, configured_max: float = ABSOLUTE_MODEL2_LEVERAGE_CAP) -> float:
+    """Return a finite non-negative Model 2 leverage bounded by an absolute 10x cap."""
+    if not np.isfinite(value) or value < 0:
+        return 0.0
+    return float(min(value, configured_max, ABSOLUTE_MODEL2_LEVERAGE_CAP))
+
 
 def spread_atr(spread: pd.Series, window: int) -> pd.Series:
     """Average True Range analogue for a synthetic spread series (no OHLC available),

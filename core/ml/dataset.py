@@ -24,6 +24,29 @@ import numpy as np
 import pandas as pd
 
 
+class IndexedSequenceView:
+    """Lazy index view over overlapping sequences; advanced indexing is batch-sized."""
+
+    def __init__(self, source: np.ndarray, indices: np.ndarray | None = None) -> None:
+        self.source = source
+        self.indices = np.arange(source.shape[0], dtype=np.int64) if indices is None else np.asarray(indices, dtype=np.int64)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (len(self.indices), *self.source.shape[1:])
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return IndexedSequenceView(self.source, self.indices[key])
+        return self.source[self.indices[key]]
+
+    def reshape(self, *shape):
+        raise TypeError("IndexedSequenceView is lazy; reshape a bounded batch instead")
+
+
 def make_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
     """Turn a (n, features) matrix into (n - seq_len + 1, seq_len, features)
     sliding windows. Window ``i`` covers rows ``[i, i + seq_len - 1]`` and is
@@ -31,7 +54,10 @@ def make_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
     n = X.shape[0]
     if n < seq_len:
         return np.empty((0, seq_len, X.shape[1]), dtype=X.dtype)
-    return np.stack([X[i : i + seq_len] for i in range(n - seq_len + 1)])
+    # A strided view avoids materializing the full overlapping sequence tensor.
+    # Callers must treat the returned array as read-only; batch slices are
+    # copied only when transferred to the accelerator.
+    return np.lib.stride_tricks.sliding_window_view(X, seq_len, axis=0).transpose(0, 2, 1)
 
 
 @dataclass
@@ -84,7 +110,9 @@ def build_row_level_dataset(
     less, which is the safe direction for a leakage guard.
     """
     combined = features.join(labels, how="inner").dropna()
-    X = combined.drop(columns=["label", "t1"])
+    # Keep only the original feature columns. Outcome columns such as MFE/MAE
+    # are future-known labels and must never become model inputs.
+    X = features.loc[combined.index]
     y = combined["label"].astype(int)
     t1_pos = combined.index.get_indexer(combined["t1"], method="bfill")
     t1_pos = np.where(t1_pos < 0, len(combined) - 1, t1_pos)

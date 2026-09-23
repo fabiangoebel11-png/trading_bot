@@ -1,0 +1,44 @@
+{
+  "data": {
+    "symbols": ["BTC/USDT", "ETH/USDT"],
+    "base_timeframe": "5m"
+  },
+  "ml": {
+    "enabled": true,
+    "assets": ["NASDAQ100_PROXY", "SP500_PROXY"],
+    "optional_assets": [],
+    "market_cache_dir": "data/market",
+    "model_dir": "data/models/model1b_equity",
+    "base_timeframe": "5m",
+    "history_days": 365,
+    "timeframe_history_days": {"5m": 365, "15m": 365, "1h": 365, "4h": 365, "1d": 14600},
+    "timeframes": ["5m", "15m", "1h", "4h", "1d"],
+    "higher_timeframes": ["15m", "1h", "4h", "1d"],
+    "market_assets": {
+      "NASDAQ100_PROXY": {"provider": "yfinance", "provider_by_timeframe": {"5m": "twelve_data", "1d": "yfinance"}, "provider_symbols": {"twelve_data": "QQQ", "yfinance": "QQQ"}, "symbol": "QQQ", "market_type": "equity_index", "derive_from": "5m", "session_timezone": "America/New_York", "history_days_by_timeframe": {"5m": 365, "15m": 365, "1h": 365, "4h": 365, "1d": 14600}},
+      "SP500_PROXY": {"provider": "yfinance", "provider_by_timeframe": {"5m": "twelve_data", "1d": "yfinance"}, "provider_symbols": {"twelve_data": "SPY", "yfinance": "SPY"}, "symbol": "SPY", "market_type": "equity_index", "derive_from": "5m", "session_timezone": "America/New_York", "history_days_by_timeframe": {"5m": 365, "15m": 365, "1h": 365, "4h": 365, "1d": 14600}}
+    },
+    "context_assets": {
+      "VIX": {"provider": "yfinance", "symbol": "^VIX", "market_type": "equity_index"},
+      "US10Y": {"provider": "yfinance", "symbol": "^TNX", "market_type": "rate"},
+      "EURUSD": {"provider": "yfinance", "symbol": "EURUSD=X", "market_type": "fx"},
+      "GOLD": {"provider": "yfinance", "symbol": "GC=F", "market_type": "commodity"},
+      "WTI": {"provider": "yfinance", "symbol": "CL=F", "market_type": "commodity"},
+      "DAX": {"provider": "yfinance", "symbol": "^GDAXI", "market_type": "equity_index"}
+    },
+    "macro_symbols": ["^VIX", "^TNX", "EURUSD=X", "GC=F", "CL=F", "^GDAXI"],
+    "breadth_enabled": false,
+    "class_weight_mode": "balanced_focal",
+    "focal_gamma": 2.0,
+    "label_smoothing": 0.0,
+    "entry_quality_mode": "payoff_volatility_compression",
+    "entry_quality_loss_weight": 1.0,
+    "direction_loss_weight": 0.0,
+    "model_profile": "equity_intraday",
+    "train_end": "2025-12-31 23:59:59",
+    "validation_start": "2026-01-01 00:00:00",
+    "validation_end": "2026-06-30 23:59:59",
+    "test_start": "2026-07-01 00:00:00",
+    "test_end": null
+  }
+}

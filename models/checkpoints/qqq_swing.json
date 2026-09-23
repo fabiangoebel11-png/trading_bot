@@ -1,0 +1,76 @@
+{
+  "entry_branch_widths": [
+    12,
+    12
+  ],
+  "asset": "QQQ",
+  "daily_data_start": "1999-03-10T00:00:00+00:00",
+  "daily_data_end": "2026-09-22T00:00:00+00:00",
+  "intraday_data_start": "2023-09-25 13:30:00+00:00",
+  "intraday_data_end": "2026-09-22 19:00:00+00:00",
+  "daily_only_samples": 5988,
+  "full_multitimeframe_samples": 56288,
+  "asset_data_start": "1999-07-16T00:00:00+00:00",
+  "asset_data_end": "2026-08-21T19:55:00+00:00",
+  "feature_version": "swing-v1",
+  "target_version": "swing-targets-v1",
+  "lookback": 90,
+  "target_horizons": [
+    1,
+    3,
+    5,
+    10,
+    20
+  ],
+  "feature_count": 54,
+  "train_samples": 43573,
+  "validation_samples": 9321,
+  "test_samples": 9342,
+  "config": {
+    "enabled": true,
+    "assets": [
+      "QQQ",
+      "SPY"
+    ],
+    "market_cache_dir": "data/market",
+    "model_dir": "models/checkpoints",
+    "daily_lookback": 90,
+    "intraday_lookback_1h": 48,
+    "intraday_lookback_5m": 48,
+    "target_horizons": [
+      1,
+      3,
+      5,
+      10,
+      20
+    ],
+    "batch_size": 256,
+    "learning_rate": 0.001,
+    "epochs": 30,
+    "dropout": 0.2,
+    "hidden_dimensions": [
+      128,
+      64
+    ],
+    "swing_score_weight": 0.7,
+    "entry_score_weight": 0.3,
+    "max_model2_leverage": 10.0,
+    "validation_fraction": 0.15,
+    "test_fraction": 0.15,
+    "purge_days": 20,
+    "feature_version": "swing-v1",
+    "target_version": "swing-targets-v1",
+    "macro_reporting_lag_days": 1,
+    "macro_symbols": [
+      "^VIX",
+      "^TNX",
+      "EURUSD=X",
+      "GC=F",
+      "CL=F",
+      "^GDAXI"
+    ]
+  },
+  "max_model2_leverage": 10.0,
+  "training_date": "2026-09-23T12:18:43.074431+00:00",
+  "model_type": "swing"
+}

@@ -1,3 +1,8 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+
 # Environments
 .venv/
 env/
@@ -6,13 +11,31 @@ env/
 __pycache__/
 *.pyc
 
-# API Keys & Configs (Sehr wichtig für später!)
-.env
+# Runtime state, databases, and logs
+*.db
+*.sqlite3
+*.log
+*.jsonl
+data/live_state.json
+data/trading_state.db
+
+# Local market/data caches (downloaded or generated during operation)
+data/market/
+data/*.csv
+data/*.parquet
+
+# API Keys & local-only config
 /config.py
+
+# Generated reports and arbitrary JSON. Model metadata is explicitly allowed
+# below because it is required to reconstruct the committed checkpoints.
 *.json
 
-# Trained models ARE meant to be shared across machines (via git) instead of
-# retrained on every clone -- re-allow the metadata sidecar the blanket
-# *.json rule above would otherwise exclude (the .pt weights aren't matched
-# by any rule and are already tracked).
-!data/models/*.json
+# Model artifacts: current checkpoint total is ~14.45 MB, so Git LFS is not
+# required at present. Move these to Git LFS or a GitHub Release if they grow
+# beyond GitHub's regular-file limits.
+!data/models/**/*.pt
+!data/models/**/*.json
+!data/models/**/*.csv
+!models/**/*.pt
+!models/**/*.json
