@@ -2,8 +2,15 @@
 
 ## Quickstart
 
+Für einen neuen Windows-Rechner:
+
 1. **Repository klonen:** `git clone <dein-repo-url>` und in das Projektverzeichnis wechseln.
-2. **Umgebung installieren:**
+2. **Doppelklick auf `setup.bat`:** Die virtuelle Umgebung und alle Abhängigkeiten werden installiert. Falls `.env` fehlt, fragt das Skript die Telegram-Daten ab und erstellt sie.
+3. **Doppelklick auf `start.bat`:** Daemon, Paper-Broker und Streamlit-GUI werden in separaten Fenstern gestartet.
+
+Manuelle Installation:
+
+1. **Umgebung installieren:**
 	```powershell
 	uv venv
 	uv pip install -e .
@@ -12,7 +19,7 @@
 3. **Konfiguration anlegen:** `Copy-Item .env.example .env` und die lokalen Credentials in `.env` eintragen. Die echte `.env` wird nie versioniert.
 4. **Starten:** `.\start.ps1` öffnet Daemon, Paper-Broker und Streamlit-GUI in separaten Fenstern. Die GUI ist danach unter `http://localhost:8501` erreichbar.
 
-`core.ml.device` verwendet automatisch CUDA, wenn verfügbar, und sonst CPU. Der Daemon meldet beim Start `Inference Device: CUDA` oder `Inference Device: CPU`. Das Startskript startet einen beendeten Prozess nach 10 Sekunden erneut. Zum Beenden das jeweilige Prozessfenster schließen.
+`start.bat` erzwingt über `TRADING_BOT_FORCE_CPU=1` CPU-Inferenz. Der zentrale Device-Resolver fällt außerdem automatisch auf CPU zurück, wenn keine CUDA-fähige GPU verfügbar ist. `core.ml.device` meldet beim Daemon-Start `Inference Device: CUDA` oder `Inference Device: CPU`. Das Startskript startet einen beendeten Prozess nach 10 Sekunden erneut. Zum Beenden das jeweilige Prozessfenster schließen.
 
 ## Repository-Inhalt und Modelle
 

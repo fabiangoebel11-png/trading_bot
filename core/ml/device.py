@@ -6,6 +6,8 @@ RTX 3070 eGPU when available and falls back to CPU otherwise.
 """
 from __future__ import annotations
 
+import os
+
 try:
     import torch
 except ImportError:  # pragma: no cover - only hit without the "ml" extra installed
@@ -21,7 +23,8 @@ def get_device(prefer_cuda: bool = True):
     fixed-shape LSTM batches used here (safe win on a single dedicated GPU)."""
     if torch is None:
         raise ImportError("PyTorch is not installed. Run `uv sync --extra ml`.")
-    if prefer_cuda:
+    force_cpu = os.getenv("TRADING_BOT_FORCE_CPU", "").strip().lower() in {"1", "true", "yes", "on"}
+    if prefer_cuda and not force_cpu:
         try:
             if torch.cuda.is_available():
                 torch.backends.cudnn.benchmark = True
