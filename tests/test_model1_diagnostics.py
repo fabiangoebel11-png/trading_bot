@@ -64,6 +64,39 @@ def test_model1_real_cached_predictions_are_finite() -> None:
         assert np.isfinite(outputs["expected_return"]).all()
 
 
+def test_tcn_early_stopping_uses_patience_and_resets_after_improvement() -> None:
+    from core.config import TrendMLConfig
+    from core.ml.tcn_model import TCNTrendModel
+
+    config = TrendMLConfig()
+    config.early_stopping_patience = 3
+    model = TCNTrendModel(config, n_features=2, prefer_cuda=False)
+    state = {"weight": np.array([1.0, 2.0], dtype=np.float32)}
+
+    best_val_loss = float("inf")
+    best_state = None
+    epochs_without_improvement = 0
+
+    for loss_value in (1.0, 1.2, 1.5, 0.9, 1.2, 1.3, 1.4):
+        best_val_loss, best_state, epochs_without_improvement, _, stop = model._apply_early_stopping(
+            current_state=state,
+            best_val_loss=best_val_loss,
+            val_loss=float(loss_value),
+            best_state=best_state,
+            epochs_without_improvement=epochs_without_improvement,
+        )
+        if loss_value == 1.0:
+            assert stop is False
+            assert epochs_without_improvement == 0
+        elif loss_value == 0.9:
+            assert stop is False
+            assert epochs_without_improvement == 0
+        elif loss_value == 1.4:
+            assert stop is True
+            assert epochs_without_improvement == 3
+            break
+
+
 def test_balanced_focal_direction_loss_is_finite() -> None:
     import torch
 

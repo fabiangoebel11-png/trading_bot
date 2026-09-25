@@ -18,20 +18,50 @@ def torch_available() -> bool:
     return torch is not None
 
 
-def get_device(prefer_cuda: bool = True):
-    """Return the best available torch device, enabling cuDNN autotuning for the
-    fixed-shape LSTM batches used here (safe win on a single dedicated GPU)."""
+def _normalize_requested_device(requested_device: str | None) -> str | None:
+    if requested_device is None:
+        return None
+    normalized = str(requested_device).strip().lower()
+    if normalized in {"", "auto"}:
+        return "auto"
+    if normalized in {"cpu", "cuda"}:
+        return normalized
+    raise ValueError(f"Unsupported device mode: {requested_device!r}. Expected one of: cpu, cuda, auto.")
+
+
+def resolve_device(requested_device: str | None = None, *, prefer_cuda: bool = True, force_cpu: bool | None = None):
+    """Resolve the active torch device with explicit CPU/CUDA policy semantics.
+
+    - training_device='cuda' requires real CUDA availability and fails hard
+      instead of silently falling back to CPU.
+    - training_device='cpu' or inference_device='cpu' forces CPU.
+    - auto/default behavior prefers CUDA when available and otherwise falls back
+      to CPU.
+    """
     if torch is None:
         raise ImportError("PyTorch is not installed. Run `uv sync --extra ml`.")
-    force_cpu = os.getenv("TRADING_BOT_FORCE_CPU", "").strip().lower() in {"1", "true", "yes", "on"}
-    if prefer_cuda and not force_cpu:
-        try:
-            if torch.cuda.is_available():
-                torch.backends.cudnn.benchmark = True
-                return torch.device("cuda")
-        except Exception:  # noqa: BLE001 - broken/missing CUDA must degrade to CPU
-            pass
+    if force_cpu is None:
+        force_cpu = os.getenv("TRADING_BOT_FORCE_CPU", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    requested = _normalize_requested_device(requested_device)
+    if force_cpu:
+        return torch.device("cpu")
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for training_device='cuda' but CUDA is not available in this environment.")
+        torch.backends.cudnn.benchmark = True
+        return torch.device("cuda")
+    if prefer_cuda and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        return torch.device("cuda")
     return torch.device("cpu")
+
+
+def get_device(prefer_cuda: bool = True, *, force_cpu: bool | None = None, requested_device: str | None = None):
+    """Backward-compatible device selection helper."""
+    return resolve_device(requested_device=requested_device, prefer_cuda=prefer_cuda, force_cpu=force_cpu)
 
 
 def device_summary(device) -> str:

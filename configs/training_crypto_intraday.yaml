@@ -24,6 +24,8 @@
     "breadth_enabled": false,
     "class_weight_mode": "balanced",
     "model_profile": "crypto_intraday",
+    "label_horizon": 1,
+    "forecast_horizons": [1, 4, 8, 12, 24],
     "train_end": "2024-12-31 23:59:59",
     "validation_start": "2025-01-01 00:00:00",
     "validation_end": "2025-12-31 23:59:59",

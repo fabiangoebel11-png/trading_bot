@@ -41,6 +41,48 @@ def test_ccxt_pagination_deduplicates_and_reports_partial(monkeypatch, tmp_path:
     assert not (tmp_path / "ohlcv_BTC-USDT_3650d.csv").exists()
 
 
+def test_ccxt_complete_stale_seed_requests_a_nonzero_tail_page(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+
+    class TailExchange(_FakeExchange):
+        def fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int):
+            calls.append((since, limit))
+            return []
+
+    monkeypatch.setattr(data_loader.ccxt, "fake", TailExchange, raising=False)
+    now = pd.Timestamp.utcnow().tz_convert("UTC").floor("h")
+    seed = pd.DataFrame(
+        {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [1.0]},
+        index=pd.DatetimeIndex([now - pd.Timedelta(days=3)]),
+    )
+    data_loader.fetch_ohlcv_history(
+        "BTC/USDT", "1h", 3, cache_dir=str(tmp_path), exchange_id="fake", use_cache=False, seed_frame=seed,
+    )
+
+    assert calls
+    assert calls[0][1] >= 1
+
+
+def test_ccxt_substantial_late_seed_continues_from_its_tail(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+
+    class TailExchange(_FakeExchange):
+        def fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int):
+            calls.append((since, limit))
+            return []
+
+    monkeypatch.setattr(data_loader.ccxt, "fake", TailExchange, raising=False)
+    now = pd.Timestamp.utcnow().tz_convert("UTC").floor("h")
+    index = pd.date_range(now - pd.Timedelta(hours=61), periods=58, freq="h")
+    seed = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0}, index=index)
+    data_loader.fetch_ohlcv_history(
+        "BTC/USDT", "1h", 3, cache_dir=str(tmp_path), exchange_id="fake", use_cache=False, seed_frame=seed,
+    )
+
+    assert calls
+    assert calls[0][0] == int((index.max() + pd.Timedelta(hours=1)).timestamp() * 1000)
+
+
 def test_quality_report_distinguishes_session_volume_and_coverage() -> None:
     index = pd.date_range("2024-01-01", periods=3, freq="1d", tz="UTC")
     frame = pd.DataFrame(

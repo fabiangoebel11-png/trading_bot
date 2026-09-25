@@ -194,6 +194,13 @@ def align_macro_to_intraday(
     macro data point that had already closed in the past (identical causality
     pattern to ``core.macro._align_daily_to_index``).
 
+    This deliberately avoids building a full ``macro_index.union(target_index)``
+    intermediate, because for a 5m target the union creates a large temporary
+    DataFrame that is then forward-filled again. The macro series is daily and
+    therefore only needs to be aligned at the daily level and then broadcast to
+    all intraday timestamps in that day. This keeps the semantics causal while
+    reducing the temporary memory footprint substantially.
+
     Also appends ``age_column`` (default ``macro_data_age_hours``): hours
     elapsed since the last *actual* (non-ffilled) observation. Crypto trades
     24/7 but the underlying equity-index futures/VIX data only update on US
@@ -208,25 +215,45 @@ def align_macro_to_intraday(
     brittle calendar-rule special cases. This helper is reused for the
     higher-timeframe features below (``age_column`` given a distinct name per
     source there) since both share the exact same causal shift+ffill pattern."""
-    # Normalize both sides before any union/reindex operation. Mixing a naive
-    # DatetimeIndex with a timezone-aware one can make pandas construct an
-    # object/ndarray-backed index, which breaks timedelta arithmetic and can
-    # also produce positional rather than timestamp alignment.
+    # Normalize both sides before any reindexing. Mixing a naive DatetimeIndex
+    # with a timezone-aware one can make pandas construct an object-backed index,
+    # which breaks timedelta arithmetic and can also produce positional rather
+    # than timestamp alignment.
     macro = macro_features_daily.copy()
     macro.index = pd.DatetimeIndex(pd.to_datetime(macro.index, utc=True))
-    target = pd.DatetimeIndex(pd.to_datetime(target_index, utc=True))
+    target = pd.DatetimeIndex(pd.to_datetime(target_index, utc=True)).sort_values()
+
+    if macro.empty or target.empty:
+        aligned = pd.DataFrame(index=target)
+        aligned[age_column] = np.nan
+        return aligned
+
     lagged = macro.sort_index().shift(reporting_lag_days)
-    union_index = lagged.index.union(target).sort_values()
-    reindexed = lagged.reindex(union_index)
+    target_days = target.normalize()
+    unique_days = pd.DatetimeIndex(target_days.unique())
+    # Only align at the daily grain and then broadcast to intraday timestamps.
+    daily_aligned = lagged.reindex(unique_days).ffill()
 
-    has_data = reindexed.notna().any(axis=1)
-    timeline = pd.Series(union_index, index=union_index, dtype="datetime64[ns, UTC]")
-    observation_time = timeline.where(has_data).ffill()
-    age_hours = (timeline - observation_time).dt.total_seconds() / 3600.0
+    aligned = pd.DataFrame(index=target)
+    for column in lagged.columns:
+        aligned[column] = daily_aligned[column].reindex(target_days).to_numpy()
 
-    aligned = reindexed.ffill().reindex(target)
-    aligned[age_column] = age_hours.reindex(target).to_numpy()
-    aligned.index = pd.DatetimeIndex(pd.to_datetime(target_index, utc=True))
+    valid_dates = lagged.index[lagged.notna().any(axis=1)]
+    if valid_dates.empty:
+        aligned[age_column] = np.nan
+    else:
+        observed_dates = pd.DatetimeIndex(pd.to_datetime(valid_dates, utc=True))
+        search_pos = observed_dates.searchsorted(target_days, side="right") - 1
+        first_valid_mask = target_days >= observed_dates[0]
+        search_pos = np.where(first_valid_mask, search_pos, -1)
+        search_pos = np.clip(search_pos, 0, len(observed_dates) - 1)
+        last_observed = observed_dates.take(search_pos)
+        age_hours = np.full(len(target_days), np.nan, dtype=float)
+        valid_idx = np.flatnonzero(first_valid_mask)
+        age_hours[valid_idx] = (target_days[valid_idx] - last_observed[valid_idx]).total_seconds() / 3600.0
+        aligned[age_column] = age_hours
+
+    aligned.index = target
     return aligned
 
 
@@ -311,6 +338,35 @@ def build_breadth_features(close: pd.Series, breadth_return: pd.Series, config: 
     return out
 
 
+def align_time_indexed_to_intraday(
+    source: pd.DataFrame,
+    target_index: pd.DatetimeIndex,
+    age_column: str,
+) -> pd.DataFrame:
+    """Align a time-indexed feature table onto an intraday index using the last
+    observed prior value, without reusing the daily macro helper that broadcasts
+    by calendar day. This preserves higher-timeframe sematics for 15m/1h feature
+    rows while keeping the same causal forward-fill rule."""
+    data = source.copy()
+    data.index = pd.DatetimeIndex(pd.to_datetime(data.index, utc=True))
+    target = pd.DatetimeIndex(pd.to_datetime(target_index, utc=True)).sort_values()
+    if data.empty or target.empty:
+        aligned = pd.DataFrame(index=target)
+        aligned[age_column] = np.nan
+        return aligned
+
+    union = data.index.union(target)
+    aligned = data.reindex(union).ffill().loc[target].copy()
+
+    observed = data.index.sort_values()
+    search_pos = np.searchsorted(observed, target, side="right") - 1
+    search_pos = np.clip(search_pos, 0, len(observed) - 1)
+    last_observed = observed.take(search_pos)
+    age_hours = (target - last_observed).total_seconds() / 3600.0
+    aligned[age_column] = age_hours
+    return aligned
+
+
 def build_feature_matrix(
     ohlc: pd.DataFrame,
     macro_prices: pd.DataFrame | None,
@@ -332,13 +388,10 @@ def build_feature_matrix(
         htf_features = build_higher_timeframe_features(ohlc, rule, config)
         if htf_features.empty:
             continue
-        # Zero reporting lag: unlike real-world macro data, a self-resampled
-        # higher-timeframe candle is already indexed at its own close time
-        # (see build_higher_timeframe_features), so the only causality step
-        # needed is the ffill onto the 1h index -- reusing the exact same
-        # helper as the macro alignment keeps this to one code path.
-        htf_aligned = align_macro_to_intraday(
-            htf_features, ohlc.index, reporting_lag_days=0, age_column=f"htf_{rule}_data_age_hours"
+        htf_aligned = align_time_indexed_to_intraday(
+            htf_features,
+            ohlc.index,
+            age_column=f"htf_{rule}_data_age_hours",
         )
         features = features.join(htf_aligned)
     return features

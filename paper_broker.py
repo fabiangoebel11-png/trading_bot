@@ -102,6 +102,14 @@ class PaperBroker:
         row = conn.execute("SELECT * FROM paper_portfolio WHERE id = 1").fetchone()
         return dict(row)
 
+    @staticmethod
+    def _drawdown_pct(portfolio: dict) -> float:
+        initial = float(portfolio["initial_capital_eur"])
+        equity = float(portfolio["equity_eur"])
+        if initial <= 0.0:
+            return 1.0
+        return max((initial - equity) / initial, 0.0)
+
     def _open_trades(self, conn) -> list[dict]:
         return [dict(row) for row in conn.execute("SELECT * FROM open_trades").fetchall()]
 
@@ -174,14 +182,14 @@ class PaperBroker:
                     exit_reason = "stop_loss"
                 elif price >= trade["take_profit_price"]:
                     exit_reason = "take_profit"
-                elif price <= trade["knockout_barrier_price"]:
+                elif trade.get("protection_model") != "underlying_no_liquidation" and price <= trade["knockout_barrier_price"]:
                     exit_reason = "knockout"
             else:
                 if price >= new_stop:
                     exit_reason = "stop_loss"
                 elif price <= trade["take_profit_price"]:
                     exit_reason = "take_profit"
-                elif price >= trade["knockout_barrier_price"]:
+                elif trade.get("protection_model") != "underlying_no_liquidation" and price >= trade["knockout_barrier_price"]:
                     exit_reason = "knockout"
 
             # Regime-Dreh-Erkennung: nutzt das jeweils fuehrende Signal
@@ -298,7 +306,9 @@ class PaperBroker:
 
             self._open_trade(conn, setup, params, market, now)
             open_risk_eur += params.risk_amount_eur
-            if len(open_trades) + 1 >= MAX_CONCURRENT_TRADES:
+            portfolio = self._portfolio(conn)
+            open_trades = self._open_trades(conn)
+            if len(open_trades) >= MAX_CONCURRENT_TRADES:
                 break
 
     def _build_setup(self, conn, asset: str, asset_class: str, market: dict, portfolio: dict, open_risk_eur: float) -> TradeSetup | None:
@@ -331,6 +341,10 @@ class PaperBroker:
             atr=float(market["atr"] or 0.0), expected_mae=float(lead_signal["expected_mae"]), expected_mfe=float(lead_signal["expected_mfe"]),
             score=float(lead_signal["swing_opportunity_score"] or lead_signal["score"]), capital_eur=float(portfolio["equity_eur"]),
             open_risk_eur=open_risk_eur,
+            instrument_type="crypto_perpetual" if asset_class == "crypto" else "equity_underlying",
+            available_margin_eur=max(float(portfolio["cash_eur"]), 0.0),
+            margin_in_use_eur=max(float(portfolio["equity_eur"]) - float(portfolio["cash_eur"]), 0.0),
+            drawdown_pct=self._drawdown_pct(portfolio),
         )
         object.__setattr__(setup, "_reason", reason)  # stash for _open_trade without changing the dataclass shape
         return setup
@@ -350,14 +364,16 @@ class PaperBroker:
             "INSERT INTO open_trades (trade_id, asset, asset_class, direction, model_source, entry_price, entry_time, "
             "quantity, notional_eur, margin_eur, leverage, stop_loss_price, take_profit_price, knockout_barrier_price, "
             "initial_stop_loss_price, current_price, unrealized_pnl_eur, entry_score, swing_score, expected_mfe, expected_mae, "
-            "expected_duration_bars, opened_reason, last_funding_time, entry_fees_eur) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0.0,?,?,?,?,?,?,?,?)",
+            "expected_duration_bars, opened_reason, last_funding_time, entry_fees_eur, instrument_type, protection_model, "
+            "liquidation_price, safety_barrier_price) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 trade_id, setup.asset, setup.asset_class, setup.direction,
                 "crypto_sniper" if setup.asset_class == "crypto" else "model2_swing+model1b_entry",
                 executed_entry_price, now.isoformat(), params.quantity, notional_eur, params.margin_eur, params.leverage,
                 params.stop_loss_price, params.take_profit_price, params.knockout_barrier_price, params.stop_loss_price,
-                executed_entry_price, None, None, setup.expected_mfe, setup.expected_mae, None, reason, None, entry_fee,
+                executed_entry_price, 0.0, None, None, setup.expected_mfe, setup.expected_mae, None, reason, None, entry_fee,
+                params.instrument_type, params.protection_model, params.liquidation_price, params.safety_barrier_price,
             ),
         )
         conn.execute(

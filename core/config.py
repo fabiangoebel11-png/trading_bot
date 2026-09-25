@@ -52,6 +52,10 @@ def _default_portfolio_shadow_log_path() -> str:
     return str(_PROJECT_ROOT / "data" / "ml_portfolio_shadow_log.csv")
 
 
+def _default_trade_quality_model_dir() -> str:
+    return str(_PROJECT_ROOT / "data" / "models" / "trade_quality")
+
+
 @dataclass
 class DataConfig:
     # Universe strictly capped at 3 crypto majors (BTC/ETH + one broad-market proxy,
@@ -297,6 +301,11 @@ class TrendMLConfig:
     """
 
     enabled: bool = False
+    model_id: str = "tcn_legacy"
+    model_role: str = "FORECAST"
+    production_timeframe: str = "1h"
+    context_required: bool = False
+    context_feature_version: str = "none"
     base_timeframe: str = "5m"  # primary prediction timeframe; higher frames are context
     # Raised from 1095 to match DataConfig's 2500-day cap: ``core/ml/train.py:
     # load_ml_ohlc`` intersects all 3 symbols' timestamps, so this is only an
@@ -376,6 +385,10 @@ class TrendMLConfig:
     # (deeper context/receptive field below can actually inform a further-out
     # touch outcome; compute cost is irrelevant per user direction).
     label_horizon: int = 72
+    forecast_horizons: tuple[int, ...] = (72,)
+    @property
+    def primary_horizon(self) -> int:
+        return int(self.forecast_horizons[0]) if self.forecast_horizons else int(self.label_horizon)
     barrier_atr_multiple: float = 2.0
     stop_atr_multiple: float = 2.0
     take_profit_atr_multiple: float = 2.0
@@ -415,6 +428,9 @@ class TrendMLConfig:
             "EURUSD": {"provider": "yfinance", "symbol": "EURUSD=X", "market_type": "fx"},
             "GOLD": {"provider": "yfinance", "symbol": "GC=F", "market_type": "commodity"},
             "WTI": {"provider": "yfinance", "symbol": "CL=F", "market_type": "commodity"},
+            "DAX": {"provider": "yfinance", "symbol": "^GDAXI", "market_type": "equity_index"},
+            "ES": {"provider": "yfinance", "symbol": "ES=F", "market_type": "equity_index"},
+            "NQ": {"provider": "yfinance", "symbol": "NQ=F", "market_type": "equity_index"},
         }
     )
     market_cache_dir: str = field(default_factory=_default_market_cache_dir)
@@ -464,14 +480,15 @@ class TrendMLConfig:
     num_layers: int = 6  # dilations 1,2,4,8,16,32 -> receptive field ~253 bars (~10.5 days at 1h)
     dropout: float = 0.35  # slightly higher than the 5m-era 0.3: a deeper/wider net needs more regularization
     weight_decay: float = 1e-4
-    learning_rate: float = 1e-3
-    batch_size: int = 4096
+    learning_rate: float = 3e-4
+    batch_size: int = 2048  # conservative first-pass stability batch for CUDA; avoid the 8192/0.001 combination that destabilized the multi-task TCN
     max_epochs: int = 100  # training time is not a constraint (RTX 3070); early stopping still governs actual length
     early_stopping_patience: int = 10  # a deeper network converges/plateaus more slowly than the old 4-layer net
     val_fraction: float = 0.15  # tail slice of each fold's train split, used only for early stopping
     label_smoothing: float = 0.05
     grad_clip_norm: float = 1.0
-    use_amp: bool = True  # mixed precision on the RTX 3070; no-op on CPU
+    gradient_clip_norm: float = 1.0
+    use_amp: bool = False  # conservative default: float32 path first; AMP is diagnosed separately
 
     # Purged walk-forward cross-validation.
     n_splits: int = 5
@@ -506,6 +523,8 @@ class TrendMLConfig:
     # same age are weighted identically -- no directional/profit bias. Set to
     # ``None`` or ``0`` to disable (uniform weighting, prior behavior).
     sample_weight_half_life_days: float | None = 365.0
+    training_device: str = "cuda"
+    inference_device: str = "cpu"
 
     # --- Shadow-mode / manual production gate ---
     # ``enabled`` (above) only controls whether the ML confirmation layer is
@@ -563,6 +582,26 @@ class SwingMLConfig:
     target_version: str = "swing-targets-v1"
     macro_reporting_lag_days: int = 1
     macro_symbols: list[str] = field(default_factory=lambda: ["^VIX", "^TNX", "EURUSD=X", "GC=F", "CL=F", "^GDAXI"])
+
+
+@dataclass
+class TradeQualityConfig:
+    """Setup-level meta-labeling contract; never enabled implicitly."""
+
+    enabled: bool = False
+    production_enabled: bool = False
+    model_id: str = "trade_quality_hgb"
+    model_version: str = "hgb-trade-quality-v1"
+    model_dir: str = field(default_factory=_default_trade_quality_model_dir)
+    timeframe: str = "1h"
+    horizon_bars: int = 24
+    stop_atr_multiple: float = 3.0
+    take_profit_atr_multiple: float = 6.0
+    fee_rate: float = 0.00035
+    slippage_rate: float = 0.00020
+    min_probability: float = 0.60
+    feature_version: str = "trade-entry-v1"
+    label_version: str = "directional-triple-barrier-v1"
 
 
 @dataclass
@@ -634,5 +673,12 @@ class TradingBotConfig:
     monte_carlo: MonteCarloConfig = field(default_factory=MonteCarloConfig)
     ml: TrendMLConfig = field(default_factory=TrendMLConfig)
     swing: SwingMLConfig = field(default_factory=SwingMLConfig)
+    trade_quality: TradeQualityConfig = field(default_factory=TradeQualityConfig)
     selection: PositionSelectionConfig = field(default_factory=PositionSelectionConfig)
+    training_device: str = "cuda"
+    inference_device: str = "cpu"
+
+    def __post_init__(self) -> None:
+        self.ml.training_device = self.training_device
+        self.ml.inference_device = self.inference_device
 

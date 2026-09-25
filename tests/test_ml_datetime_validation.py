@@ -38,6 +38,26 @@ def test_macro_reporting_lag_prevents_lookahead() -> None:
     assert result["value"].iloc[2] == 10.0
 
 
+def test_macro_alignment_avoids_full_union_index_expansion(monkeypatch) -> None:
+    macro = pd.DataFrame(
+        {"value": [10.0, 20.0, 30.0]},
+        index=pd.DatetimeIndex(["2024-01-01", "2024-01-02", "2024-01-03"], tz="UTC"),
+    )
+    target = pd.date_range("2024-01-01 00:00", periods=96, freq="15min", tz="UTC")
+
+    original_union = pd.DatetimeIndex.union
+
+    def fail_union(self, other, *args, **kwargs):
+        raise AssertionError("align_macro_to_intraday must not build a full union index")
+
+    monkeypatch.setattr(pd.DatetimeIndex, "union", fail_union)
+    result = align_macro_to_intraday(macro, target, reporting_lag_days=1)
+    assert result.index.equals(target)
+    assert pd.isna(result["value"].iloc[0])
+    assert pd.isna(result["macro_data_age_hours"].iloc[0])
+    monkeypatch.setattr(pd.DatetimeIndex, "union", original_union)
+
+
 def test_effective_period_clips_to_actual_symbol_history() -> None:
     index = pd.date_range("2025-01-01", periods=10, freq="D", tz="UTC")
     period = effective_period(index, "2010-01-01", "2021-12-31")

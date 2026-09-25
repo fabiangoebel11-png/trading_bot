@@ -15,18 +15,12 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-# --- Asset-Klassen-spezifische Hebel-Obergrenzen -----------------------------
-# Equities: Trade Republic KO-Zertifikate/Optionsscheine haben praktisch keinen
-# echten Hebel-Deckel seitens des Brokers, aber ein KO-Produkt mit >5x Hebel
-# auf 500 EUR Gesamtkapital wäre bei einer einzigen ungünstigen Kerze sofort
-# ausgeknockt -- 5x ist hier eine bewusste Risiko-Entscheidung, kein
-# Produktlimit.
-MAX_LEVERAGE_EQUITY = 5.0
-# Crypto: Bybit/Binance Perpetuals erlauben deutlich höhere Hebel, aber das
-# System deckelt hart auf 10x (an ``ABSOLUTE_MODEL2_LEVERAGE_CAP`` in
-# ``core/risk.py`` angelehnt) -- Konsistenz mit dem bereits im Rest des Systems
-# etablierten Sicherheitsdeckel.
+# --- Instrument-specific leverage ceilings -----------------------------------
+# These are technical ceilings, never a target leverage.  A plain ETF price
+# series is an underlying, not a CFD, future, certificate, or margin product.
+# It therefore has no synthetic liquidation/KO level and is capped at 1x.
 MAX_LEVERAGE_CRYPTO = 10.0
+MAX_LEVERAGE_EQUITY_UNDERLYING = 1.0
 
 # Fixed-Fractional-Risk-Sizing: wie viel Prozent des GESAMTEN Paper-Kapitals
 # darf ein einzelner Trade verlieren, wenn der Stop exakt getroffen wird.
@@ -58,7 +52,6 @@ class StrategyProfile:
     atr_buffer_multiple: float
     risk_per_trade_pct: float
     max_position_fraction: float
-    max_leverage_multiplier: float
 
 
 AGGRESSIVE_PROFILE = StrategyProfile(
@@ -66,14 +59,12 @@ AGGRESSIVE_PROFILE = StrategyProfile(
     atr_buffer_multiple=1.0,
     risk_per_trade_pct=0.025,
     max_position_fraction=0.45,
-    max_leverage_multiplier=1.0,
 )
 CONSERVATIVE_PROFILE = StrategyProfile(
     name="conservative",
     atr_buffer_multiple=2.25,
     risk_per_trade_pct=0.01,
     max_position_fraction=0.25,
-    max_leverage_multiplier=0.5,
 )
 
 
@@ -97,6 +88,20 @@ class TradeSetup:
     ko_safety_buffer_pct: float = DEFAULT_KO_SAFETY_BUFFER_PCT
     max_portfolio_risk_pct: float = 0.06   # Summe aller offenen Risiko-Budgets darf das nie überschreiten
     profile: str = "base"
+    # ``equity_underlying`` is the safe default for QQQ/SPY price data.  A
+    # leveraged equity product must state its instrument and exchange ceiling
+    # explicitly; asset class alone is not enough to infer leverage.
+    instrument_type: str | None = None
+    exchange_max_leverage: float | None = None
+    available_margin_eur: float | None = None
+    margin_in_use_eur: float = 0.0
+    confidence: float = 1.0
+    volatility_multiplier: float = 1.0
+    correlation_multiplier: float = 1.0
+    drawdown_pct: float = 0.0
+    max_drawdown_pct: float = 0.10
+    max_notional_eur: float | None = None
+    asset_risk_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -118,14 +123,98 @@ class RiskParameters:
     rejected: bool = False
     rejection_reason: str = ""
     profile: str = "base"
+    trade_quality: float = 0.0
+    allowed_risk_fraction: float = 0.0
+    risk_based_notional_eur: float = 0.0
+    max_allowed_leverage: float = 0.0
+    instrument_type: str = ""
+    protection_model: str = ""
+    liquidation_price: float | None = None
+    safety_barrier_price: float | None = None
 
 
-def max_leverage_for(asset_class: str) -> float:
-    if asset_class == "equity":
-        return MAX_LEVERAGE_EQUITY
+def instrument_type_for(asset_class: str, instrument_type: str | None = None) -> str:
+    """Resolve the product being modeled without guessing equity leverage."""
+    if instrument_type:
+        return instrument_type
     if asset_class == "crypto":
-        return MAX_LEVERAGE_CRYPTO
+        return "crypto_perpetual"
+    if asset_class == "equity":
+        return "equity_underlying"
     raise ValueError(f"Unknown asset_class {asset_class!r}, expected 'crypto' or 'equity'")
+
+
+def max_leverage_for(
+    asset_class: str,
+    instrument_type: str | None = None,
+    exchange_max_leverage: float | None = None,
+) -> float:
+    """Return a hard product/exchange ceiling, never a sizing target.
+
+    For CFD/future/margin products the caller must provide the actual exchange
+    or broker limit.  Normal ETF data is deliberately treated as 1x cash
+    exposure until such a product is explicitly configured.
+    """
+    resolved = instrument_type_for(asset_class, instrument_type)
+    if resolved == "crypto_perpetual":
+        ceiling = MAX_LEVERAGE_CRYPTO
+    elif resolved == "equity_underlying":
+        ceiling = MAX_LEVERAGE_EQUITY_UNDERLYING
+    elif resolved in {"equity_cfd", "equity_future", "equity_margin", "crypto_future"}:
+        if exchange_max_leverage is None or not np.isfinite(exchange_max_leverage):
+            raise ValueError(f"actual exchange_max_leverage required for {resolved}")
+        ceiling = float(exchange_max_leverage)
+    else:
+        raise ValueError(f"unsupported instrument_type {resolved!r}")
+    if exchange_max_leverage is not None:
+        ceiling = min(ceiling, float(exchange_max_leverage))
+    if not np.isfinite(ceiling) or ceiling <= 0:
+        raise ValueError("instrument leverage ceiling must be positive and finite")
+    return float(ceiling)
+
+
+def allowed_risk_fraction(
+    *,
+    base_risk_fraction: float,
+    score: float,
+    confidence: float = 1.0,
+    drawdown_pct: float = 0.0,
+    max_drawdown_pct: float = 0.10,
+    volatility_multiplier: float = 1.0,
+    correlation_multiplier: float = 1.0,
+) -> float:
+    """Calculate risk budget from quality and current portfolio conditions.
+
+    Drawdown scaling is deliberately continuous and parameter-light: risk is
+    unchanged at zero drawdown and reaches zero at the configured account
+    drawdown stop.  Volatility/correlation inputs are multipliers produced by
+    the portfolio layer, not hidden leverage rules.
+    """
+    values = (base_risk_fraction, score, confidence, drawdown_pct, max_drawdown_pct, volatility_multiplier, correlation_multiplier)
+    if not all(np.isfinite(value) for value in values) or base_risk_fraction <= 0 or max_drawdown_pct <= 0:
+        return 0.0
+    quality = float(np.clip(score / 100.0, 0.0, 1.0) * np.clip(confidence, 0.0, 1.0))
+    drawdown_scale = float(np.clip(1.0 - max(drawdown_pct, 0.0) / max_drawdown_pct, 0.0, 1.0))
+    return float(max(0.0, base_risk_fraction * quality * drawdown_scale * np.clip(volatility_multiplier, 0.0, 1.0) * np.clip(correlation_multiplier, 0.0, 1.0)))
+
+
+def select_effective_leverage(
+    risk_based_notional: float,
+    max_margin: float,
+    max_allowed_leverage: float,
+) -> float:
+    """Select the smallest leverage needed to fit notional in margin.
+
+    The risk engine chooses notional first.  Leverage only determines how much
+    margin is needed for that already-capped exposure, and can never exceed the
+    instrument/exchange ceiling.
+    """
+    if not all(np.isfinite(value) for value in (risk_based_notional, max_margin, max_allowed_leverage)):
+        return 0.0
+    if risk_based_notional <= 0 or max_margin <= 0 or max_allowed_leverage <= 0:
+        return 0.0
+    required = risk_based_notional / max_margin
+    return float(np.clip(max(1.0, required), 1.0, max_allowed_leverage))
 
 
 def compute_stop_distance_pct(entry_price: float, atr: float, expected_mae: float, atr_buffer_multiple: float) -> float:
@@ -203,36 +292,61 @@ def compute_risk_parameters(setup: TradeSetup) -> RiskParameters:
     if not all(np.isfinite(v) for v in (setup.entry_price, setup.atr, setup.expected_mae, setup.expected_mfe, setup.score, setup.capital_eur)):
         return _rejected(setup, "non-finite input")
 
+    try:
+        instrument_type = instrument_type_for(setup.asset_class, setup.instrument_type)
+        max_leverage = max_leverage_for(setup.asset_class, instrument_type, setup.exchange_max_leverage)
+    except ValueError as exc:
+        return _rejected(setup, str(exc))
+
     stop_distance_pct = compute_stop_distance_pct(setup.entry_price, setup.atr, setup.expected_mae, setup.atr_buffer_multiple)
     take_profit_distance_pct = compute_take_profit_distance_pct(setup.expected_mfe, stop_distance_pct)
     risk_reward_ratio = take_profit_distance_pct / stop_distance_pct if stop_distance_pct > 0 else 0.0
 
-    # Confidence-Skalierung: Score 100 -> volles Risiko-Budget, Score am
-    # Schwellwert (>=80 laut AlertGate) -> reduziertes Budget. Rein linear,
-    # keine erfundene Nichtlinearität.
-    score_scale = float(np.clip(setup.score / 100.0, 0.2, 1.0))
-    raw_risk_amount_eur = setup.capital_eur * setup.risk_per_trade_pct * score_scale
+    allowed_fraction = allowed_risk_fraction(
+        base_risk_fraction=setup.risk_per_trade_pct * setup.asset_risk_multiplier,
+        score=setup.score,
+        confidence=setup.confidence,
+        drawdown_pct=setup.drawdown_pct,
+        max_drawdown_pct=setup.max_drawdown_pct,
+        volatility_multiplier=setup.volatility_multiplier,
+        correlation_multiplier=setup.correlation_multiplier,
+    )
+    raw_risk_amount_eur = setup.capital_eur * allowed_fraction
     risk_amount_eur = fixed_fractional_position_fraction(setup.capital_eur, setup.open_risk_eur, raw_risk_amount_eur, setup.max_portfolio_risk_pct)
     if risk_amount_eur <= 0:
         return _rejected(setup, "portfolio risk budget exhausted by already-open trades")
 
-    position_size_eur = risk_amount_eur / stop_distance_pct
-    max_position_eur = setup.capital_eur * setup.max_position_fraction
-    position_size_eur = float(min(position_size_eur, max_position_eur))
-
-    margin_eur = min(setup.capital_eur - setup.open_risk_eur, position_size_eur)
-    margin_eur = max(margin_eur, 1e-9)
-    leverage = position_size_eur / margin_eur
-    leverage = float(min(leverage, max_leverage_for(setup.asset_class)))
-    # Recompute notional from the capped leverage (leverage cap can bind
-    # before the risk/position-fraction caps do).
-    position_size_eur = leverage * margin_eur
+    risk_based_notional = risk_amount_eur / stop_distance_pct
+    available_margin_eur = setup.available_margin_eur if hasattr(setup, "available_margin_eur") else None
+    if available_margin_eur is None:
+        available_margin_eur = setup.capital_eur - max(setup.margin_in_use_eur, 0.0)
+    max_margin_eur = max(min(float(available_margin_eur), setup.capital_eur) * setup.max_position_fraction, 0.0)
+    max_notional_eur = max_margin_eur * max_leverage
+    if setup.max_notional_eur is not None:
+        if not np.isfinite(setup.max_notional_eur) or setup.max_notional_eur <= 0:
+            return _rejected(setup, "invalid max_notional_eur")
+        max_notional_eur = min(max_notional_eur, setup.max_notional_eur)
+    position_size_eur = float(min(risk_based_notional, max_notional_eur))
+    leverage = select_effective_leverage(position_size_eur, max_margin_eur, max_leverage)
+    if leverage <= 0:
+        return _rejected(setup, "no available margin for risk-based notional")
+    # Required margin is derived only after the final notional and leverage.
+    margin_eur = max(position_size_eur / leverage, 1e-9)
     risk_amount_eur = position_size_eur * stop_distance_pct
 
     quantity = position_size_eur / setup.entry_price
     stop_loss_price = setup.entry_price * (1.0 - stop_distance_pct) if setup.direction == "LONG" else setup.entry_price * (1.0 + stop_distance_pct)
     take_profit_price = setup.entry_price * (1.0 + take_profit_distance_pct) if setup.direction == "LONG" else setup.entry_price * (1.0 - take_profit_distance_pct)
-    knockout_barrier_price = compute_knockout_barrier(setup.entry_price, setup.direction, leverage, stop_distance_pct, setup.ko_safety_buffer_pct)
+    has_exchange_liquidation = instrument_type in {"crypto_perpetual", "crypto_future", "equity_cfd", "equity_future", "equity_margin"}
+    knockout_barrier_price = compute_knockout_barrier(setup.entry_price, setup.direction, leverage, stop_distance_pct, setup.ko_safety_buffer_pct) if has_exchange_liquidation else 0.0
+    liquidation_distance_pct = 1.0 / leverage if has_exchange_liquidation else None
+    liquidation_price = None
+    if liquidation_distance_pct is not None:
+        liquidation_price = float(
+            setup.entry_price * (1.0 - liquidation_distance_pct)
+            if setup.direction == "LONG"
+            else setup.entry_price * (1.0 + liquidation_distance_pct)
+        )
 
     return RiskParameters(
         asset=setup.asset,
@@ -250,6 +364,14 @@ def compute_risk_parameters(setup: TradeSetup) -> RiskParameters:
         stop_distance_pct=stop_distance_pct,
         take_profit_distance_pct=take_profit_distance_pct,
         profile=getattr(setup, "profile", "base"),
+        trade_quality=float(np.clip(setup.score / 100.0, 0.0, 1.0) * np.clip(setup.confidence, 0.0, 1.0)),
+        allowed_risk_fraction=allowed_fraction,
+        risk_based_notional_eur=risk_based_notional,
+        max_allowed_leverage=max_leverage,
+        instrument_type=instrument_type,
+        protection_model="exchange_liquidation_estimate" if has_exchange_liquidation else "underlying_no_liquidation",
+        liquidation_price=liquidation_price,
+        safety_barrier_price=knockout_barrier_price if has_exchange_liquidation else None,
     )
 
 
@@ -261,6 +383,7 @@ def _rejected(setup: TradeSetup, reason: str) -> RiskParameters:
         risk_amount_eur=0.0, risk_reward_ratio=0.0, stop_distance_pct=0.0,
         take_profit_distance_pct=0.0, rejected=True, rejection_reason=reason,
         profile=getattr(setup, "profile", "base"),
+        instrument_type=instrument_type_for(setup.asset_class, setup.instrument_type) if setup.asset_class in {"crypto", "equity"} else "",
     )
 
 
@@ -270,11 +393,11 @@ def compute_profile_parameters(setup: TradeSetup, profile: StrategyProfile) -> R
     This function deliberately does not inspect the ML score to decide whether
     to run. A low score still produces a transparent hypothetical setup; the
     caller decides whether it may be traded. Profile leverage is bounded by
-    the asset-class hard ceiling and never increases with holding duration.
+        the asset-class hard ceiling and never increases with holding duration.
+        The profile changes risk budget and stop policy only; effective leverage is still derived downstream.
     """
     if profile.atr_buffer_multiple <= 0 or profile.risk_per_trade_pct < 0:
         return _rejected(replace(setup, profile=profile.name), "invalid strategy profile")
-    profile_cap = max_leverage_for(setup.asset_class) * profile.max_leverage_multiplier
     adjusted = replace(
         setup,
         profile=profile.name,
@@ -282,19 +405,7 @@ def compute_profile_parameters(setup: TradeSetup, profile: StrategyProfile) -> R
         risk_per_trade_pct=profile.risk_per_trade_pct,
         max_position_fraction=profile.max_position_fraction,
     )
-    parameters = compute_risk_parameters(adjusted)
-    if parameters.rejected or parameters.leverage <= profile_cap:
-        return parameters
-    capped_notional = parameters.margin_eur * profile_cap
-    return replace(
-        parameters,
-        leverage=profile_cap,
-        position_size_eur=capped_notional,
-        margin_eur=parameters.margin_eur,
-        quantity=capped_notional / setup.entry_price,
-        risk_amount_eur=capped_notional * parameters.stop_distance_pct,
-        knockout_barrier_price=compute_knockout_barrier(setup.entry_price, setup.direction, profile_cap, parameters.stop_distance_pct, setup.ko_safety_buffer_pct),
-    )
+    return compute_risk_parameters(adjusted)
 
 
 def compute_strategy_profiles(setup: TradeSetup) -> dict[str, RiskParameters]:

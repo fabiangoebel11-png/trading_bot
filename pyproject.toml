@@ -20,16 +20,20 @@ dependencies = [
 
 [project.optional-dependencies]
 ml = [
-    "torch>=2.3.0",
+    "torch==2.6.0+cu124",
+]
+foundation = [
+    "chronos-forecasting>=2.3.2",
 ]
 
 [tool.uv]
+index-strategy = "unsafe-best-match"
 
 [tool.uv.sources]
-# CUDA-enabled wheel for the RTX 3070 (the default PyPI wheel is CPU-only on
-# Windows). If a future machine has no matching NVIDIA driver, `uv sync
-# --extra ml` will still succeed by falling back to CPU inference/training.
-torch = [{ index = "pytorch-cu124" }]
+# Only torch is required for this TCN project. torchvision/torchaudio are not
+# imported anywhere in the codebase and are intentionally not forced into the
+# ML extra to avoid the CPU-only/PyPI resolution conflicts on Windows.
+torch = { index = "pytorch-cu124" }
 
 [[tool.uv.index]]
 name = "pytorch-cu124"

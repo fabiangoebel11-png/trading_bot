@@ -175,3 +175,35 @@ def qualified_trade_labels(
         where=np.maximum(adverse, 1e-9) > 0.0,
     )
     return qualified
+
+
+def build_horizon_label_map(
+    close: pd.Series,
+    atr: pd.Series,
+    horizons: int | list[int] | tuple[int, ...],
+    atr_multiple: float,
+    *,
+    high: pd.Series | None = None,
+    low: pd.Series | None = None,
+    stop_atr_multiple: float | None = None,
+    take_profit_atr_multiple: float | None = None,
+    min_quality_ratio: float = 1.5,
+    min_atr_move: float = 0.5,
+) -> dict[int, pd.DataFrame]:
+    """Compute trade-quality labels for each configured forecast horizon."""
+    normalized = tuple(int(h) for h in ([horizons] if isinstance(horizons, int) else horizons))
+    labels: dict[int, pd.DataFrame] = {}
+    for horizon in normalized:
+        labels[horizon] = qualified_trade_labels(
+            close,
+            atr,
+            horizon,
+            atr_multiple,
+            high=high,
+            low=low,
+            stop_atr_multiple=stop_atr_multiple,
+            take_profit_atr_multiple=take_profit_atr_multiple,
+            min_quality_ratio=min_quality_ratio,
+            min_atr_move=min_atr_move,
+        )
+    return labels

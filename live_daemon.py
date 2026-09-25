@@ -21,8 +21,9 @@ import time
 import traceback
 import json
 from functools import wraps
-from datetime import datetime, timezone
+from datetime import datetime, time as clock_time, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,8 @@ from core.ml.data import load_ohlcv_parquet
 from core.ml.dataset import make_sequences
 from core.ml.device import get_device
 from core.ml.features import build_feature_matrix, fetch_breadth_basket
+from core.ml.assistant_forecasts import PUBLIC_HORIZONS, chronos2_forecast, combine_model_forecasts, direct_swing_forecasts, direct_tcn_forecasts
+from core.ml.forecast_contract import context_feature_frame
 from core.ml.inference import load_symbol_model
 from core.ml.providers import AssetSpec, asset_specs_from_config, canonical_cache_path, prepare_asset_specs
 from core.ml.scoring import continuous_opportunity_score
@@ -44,9 +47,11 @@ from core.signal_orchestrator import AlertGate, AlertGateConfig, intraday_snapsh
 from core.strategy import compute_atr
 from risk_engine import TradeSetup, compute_strategy_profiles
 from core.notifications.telegram_bot import TelegramBot
+from model_integration import infer_chronos2_forecast
 
 PRICE_POLL_S = 20.0
 SIGNAL_REFRESH_S = 15 * 60.0
+ASSISTANT_ASSETS = ("BTC/USDT", "ETH/USDT", "SPY", "QQQ")
 
 # Model 2 (Swing) uses the plain ticker as its asset name; Model 1B (equity
 # intraday) uses the "logical" proxy name from TrendMLConfig.market_assets.
@@ -55,8 +60,8 @@ SIGNAL_REFRESH_S = 15 * 60.0
 EQUITY_NAME_TO_TICKER = {"NASDAQ100_PROXY": "QQQ", "SP500_PROXY": "SPY"}
 
 CONFIG_PATHS = {
-    "crypto": "configs/training_crypto_intraday.yaml",
-    "equity": "configs/training_equity_intraday.yaml",
+    "crypto": "configs/training_tcn_crypto_1h.yaml",
+    "equity": "configs/training_tcn_equity_1h.yaml",
     "swing": "configs/training_swing.yaml",
 }
 
@@ -108,7 +113,13 @@ class Model1Runner:
             return None
         if asset_name not in self._models:
             try:
-                self._models[asset_name] = load_symbol_model(asset_name, self.config)
+                model, meta = load_symbol_model(asset_name, self.config)
+                if self.config.context_required:
+                    if meta.get("training_timeframe") != self.config.base_timeframe:
+                        raise ValueError("TCN artifact training timeframe does not match production timeframe")
+                    if meta.get("context_feature_version") != self.config.context_feature_version:
+                        raise ValueError("TCN artifact lacks the required context feature contract")
+                self._models[asset_name] = (model, meta)
             except Exception as exc:  # noqa: BLE001
                 print(f"[model1] could not load checkpoint for {asset_name}: {exc}")
                 self._failed.add(asset_name)
@@ -134,6 +145,8 @@ class Model1Runner:
             outputs["opportunity"], outputs["expected_return"], outputs["expected_mfe"], outputs["expected_mae"],
         )
         return {
+            "model_id": self.config.model_id,
+            "model_version": str(meta.get("model_version", "unknown")),
             "timestamp": window.index[-1],
             "opportunity": float(outputs["opportunity"][0]),
             "expected_return": float(outputs["expected_return"][0]),
@@ -142,8 +155,45 @@ class Model1Runner:
             "expected_mae": float(outputs["expected_mae"][0]),
             "entry_score": float(outputs["entry_score"][0]),
             "score": float(quality["score"][0]),
+            "forecast_score": float(quality["score"][0]),
+            "direction_probability_short": float(outputs["probabilities"][0, 0]),
+            "direction_probability_long": float(outputs["probabilities"][0, 2]),
+            "lower_quantile": None,
+            "median_quantile": None,
+            "upper_quantile": None,
+            "expected_volatility": None,
+            "forecast_uncertainty": "UNKNOWN",
+            "context_status": "OK" if macro_prices is not None and not macro_prices.empty else "MISSING",
             "direction": str(quality["direction"][0]),
         }
+
+    def infer_by_horizon(self, asset_name: str, ohlc: pd.DataFrame, macro_prices: pd.DataFrame | None, breadth_return: pd.Series | None) -> tuple[str, str, dict[int, dict]] | None:
+        """Return each available trained head for the public assistant contract."""
+        loaded = self._model(asset_name)
+        if loaded is None:
+            return None
+        model, meta = loaded
+        features = build_feature_matrix(ohlc, macro_prices, self.config, breadth_return).reindex(columns=meta["feature_columns"])
+        valid = features.dropna()
+        sequence_length = int(meta["sequence_length"])
+        if len(valid) < sequence_length:
+            return None
+        window = valid.iloc[-sequence_length:]
+        outputs = model.predict_trade_outputs_by_horizon(make_sequences(window.to_numpy(dtype=np.float32), sequence_length))
+        normalized: dict[int, dict] = {}
+        for horizon, output in outputs.items():
+            quality = continuous_opportunity_score(output["opportunity"], output["expected_return"], output["expected_mfe"], output["expected_mae"])
+            normalized[int(horizon)] = {
+                "probabilities": output["probabilities"][0],
+                "expected_return": output["expected_return"][0],
+                "expected_mfe": output["expected_mfe"][0],
+                "expected_mae": output["expected_mae"][0],
+                "expected_duration": output["expected_duration"][0],
+                "opportunity_score": quality["score"][0],
+                "direction": quality["direction"][0],
+                "confidence": "UNKNOWN",
+            }
+        return window.index[-1].isoformat(), str(meta.get("model_version", "unknown")), normalized
 
 
 class LiveDaemon:
@@ -276,6 +326,7 @@ class LiveDaemon:
             expected_mfe=float(signal["expected_mfe"] if signal else 0.0),
             score=float(signal["score"] if signal else 0.0),
             capital_eur=float(self.swing_cfg.swing.get("initial_capital_eur", 500.0)) if isinstance(self.swing_cfg.swing, dict) else 500.0,
+            instrument_type="crypto_perpetual" if asset_class == "crypto" else "equity_underlying",
         )
         profiles = compute_strategy_profiles(setup)
         conn.execute(
@@ -285,20 +336,43 @@ class LiveDaemon:
         )
 
     # --- langsamer Takt: volle Kerzen-Aktualisierung + ML-Inferenz -----------------
-    def signal_refresh(self) -> None:
+    def signal_refresh(self, *, force_refresh: bool = False) -> None:
         now = _now()
-        self._refresh_crypto(now)
-        self._refresh_equity_and_swing(now)
+        self._refresh_crypto(now, force_refresh=force_refresh)
+        self._refresh_equity_and_swing(now, force_refresh=force_refresh)
 
-    def _prepare(self, config: TradingBotConfig) -> None:
+    def _persist_context_health(self, conn, asset: str, ohlc: pd.DataFrame, macro_df: pd.DataFrame | None) -> None:
+        if macro_df is None or macro_df.empty:
+            state_db.save_context_snapshot(state_db.DB_PATH, asset, ohlc.index[-1].isoformat(), "MISSING", {"reason": "context matrix unavailable"}, conn=conn)
+            return
+        source_names = {"GC=F": "GOLD", "^VIX": "VIX", "^TNX": "US10Y", "EURUSD=X": "EURUSD", "CL=F": "WTI", "^GDAXI": "DAX", "ES=F": "ES", "NQ=F": "NQ"}
+        context = {source_names[column]: pd.DataFrame({"close": macro_df[column]}) for column in macro_df.columns if column in source_names}
+        _, snapshot = context_feature_frame(context, ohlc.index)
+        state_db.save_context_snapshot(state_db.DB_PATH, asset, snapshot.timestamp, snapshot.status, snapshot.as_dict(), conn=conn)
+
+    @staticmethod
+    def _chronos_forecasts(asset: str, asset_class: str, ohlc: pd.DataFrame) -> dict[str, object]:
+        """Use Chronos-2 only on horizons with matching bar semantics."""
+        horizons = PUBLIC_HORIZONS if asset_class == "crypto" else ("1h", "4h", "8h", "12h")
+        return {
+            horizon: chronos2_forecast(
+                asset=asset,
+                asset_class=asset_class,
+                horizon=horizon,
+                output=infer_chronos2_forecast(asset, "1h", ohlc, horizon=horizon),
+            )
+            for horizon in horizons
+        }
+
+    def _prepare(self, config: TradingBotConfig, *, force_refresh: bool = False) -> None:
         specs = asset_specs_from_config(config)
         try:
-            self._prepare_once(config, specs)
+            self._prepare_once(config, specs, force_refresh=force_refresh)
         except Exception as exc:  # noqa: BLE001
             print(f"[daemon] data refresh failed (using stale cache if present): {exc}")
 
     @retry_with_backoff()
-    def _prepare_once(self, config: TradingBotConfig, specs) -> None:
+    def _prepare_once(self, config: TradingBotConfig, specs, *, force_refresh: bool = False) -> None:
         prepare_asset_specs(
             specs,
             cache_root=config.ml.market_cache_dir,
@@ -306,10 +380,18 @@ class LiveDaemon:
             exchange_id=config.data.exchange_id,
             default_market_type=config.data.market_type,
             twelve_data_settings=config.data.twelve_data,
+            force_refresh=force_refresh,
         )
 
-    def _refresh_crypto(self, now: datetime) -> None:
-        self._prepare(self.crypto_cfg)
+    def _refresh_crypto(self, now: datetime, *, force_refresh: bool = False) -> None:
+        self._prepare(self.crypto_cfg, force_refresh=force_refresh)
+        macro_df = None
+        try:
+            from core.ml.train import load_prepared_macro_matrix
+
+            macro_df = load_prepared_macro_matrix(self.crypto_cfg.ml)
+        except Exception as exc:  # noqa: BLE001 - missing context must remain explicit
+            print(f"[daemon] crypto context matrix unavailable: {exc}")
         breadth = None
         try:
             breadth = fetch_breadth_basket(self.crypto_cfg.data, self.crypto_cfg.ml, use_cache=True)
@@ -322,6 +404,7 @@ class LiveDaemon:
                     ohlc = _load_base_ohlc(self.crypto_cfg.ml, symbol)
                     if ohlc is None or ohlc.empty:
                         continue
+                    self._persist_context_health(conn, symbol, ohlc, macro_df)
                     atr = compute_atr(ohlc["high"], ohlc["low"], ohlc["close"], self.crypto_cfg.ml.atr_window)
                     last_close = float(ohlc["close"].iloc[-1])
                     last_atr = float(atr.iloc[-1]) if np.isfinite(atr.iloc[-1]) else 0.0
@@ -329,17 +412,25 @@ class LiveDaemon:
                         "UPDATE market_state SET atr = ?, atr_pct = ?, warmup_ready = 1 WHERE asset = ?",
                         (last_atr, last_atr / last_close if last_close else 0.0, symbol),
                     )
-                    result = self.model1_crypto.infer(symbol, ohlc, None, breadth)
-                    if result is None:
-                        continue
-                    self._write_signal(conn, symbol, "crypto_sniper", result, now)
+                    result = self.model1_crypto.infer(symbol, ohlc, macro_df, breadth)
+                    horizon_outputs = self.model1_crypto.infer_by_horizon(symbol, ohlc, macro_df, breadth)
+                    if horizon_outputs is not None:
+                        timestamp, version, outputs = horizon_outputs
+                        forecasts = direct_tcn_forecasts(asset=symbol, asset_class="crypto", model=self.crypto_cfg.ml.model_id, model_version=version, timestamp=timestamp, outputs=outputs)
+                    else:
+                        forecasts = direct_tcn_forecasts(asset=symbol, asset_class="crypto", model=self.crypto_cfg.ml.model_id, model_version="unknown", timestamp=now.isoformat(), outputs={})
+                    chronos = self._chronos_forecasts(symbol, "crypto", ohlc)
+                    forecasts = [combine_model_forecasts([forecast, chronos[forecast.horizon]]) for forecast in forecasts]
+                    state_db.replace_assistant_forecasts(conn, symbol, [item.as_dict() for item in forecasts])
+                    if result is not None:
+                        self._write_signal(conn, symbol, "crypto_sniper", result, now)
                     self._persist_strategy_profiles(conn, symbol, "crypto", now)
                 except Exception:  # noqa: BLE001
                     print(f"[daemon] crypto inference failed for {symbol}:\n{traceback.format_exc()}")
             conn.commit()
 
-    def _refresh_equity_and_swing(self, now: datetime) -> None:
-        self._prepare(self.equity_cfg)
+    def _refresh_equity_and_swing(self, now: datetime, *, force_refresh: bool = False) -> None:
+        self._prepare(self.equity_cfg, force_refresh=force_refresh)
         macro_df = None
         try:
             from core.ml.train import load_prepared_macro_matrix
@@ -351,10 +442,12 @@ class LiveDaemon:
         with state_db.connect() as conn:
             for name in self.equity_cfg.ml.assets:
                 ticker = EQUITY_NAME_TO_TICKER.get(name, name)
+                horizon_outputs = None
                 try:
                     ohlc = _load_base_ohlc(self.equity_cfg.ml, name)
                     if ohlc is None or ohlc.empty:
                         continue
+                    self._persist_context_health(conn, ticker, ohlc, macro_df)
                     atr = compute_atr(ohlc["high"], ohlc["low"], ohlc["close"], self.equity_cfg.ml.atr_window)
                     last_close = float(ohlc["close"].iloc[-1])
                     last_atr = float(atr.iloc[-1]) if np.isfinite(atr.iloc[-1]) else 0.0
@@ -363,6 +456,7 @@ class LiveDaemon:
                         (last_atr, last_atr / last_close if last_close else 0.0, ticker),
                     )
                     result = self.model1_equity.infer(name, ohlc, macro_df, None)
+                    horizon_outputs = self.model1_equity.infer_by_horizon(name, ohlc, macro_df, None)
                     if result is not None:
                         snapshot = intraday_snapshot(ticker, result["timestamp"], result)
                         self._write_snapshot(conn, ticker, "intraday", snapshot, now)
@@ -370,23 +464,46 @@ class LiveDaemon:
                     print(f"[daemon] equity model1b inference failed for {name}:\n{traceback.format_exc()}")
 
                 try:
-                    self._refresh_swing(conn, ticker, now)
+                    swing_outputs = self._refresh_swing(conn, ticker, now)
+                    if horizon_outputs is not None:
+                        timestamp, version, outputs = horizon_outputs
+                        forecasts = direct_tcn_forecasts(asset=ticker, asset_class="equity", model=self.equity_cfg.ml.model_id, model_version=version, timestamp=timestamp, outputs=outputs)
+                    else:
+                        forecasts = direct_tcn_forecasts(asset=ticker, asset_class="equity", model=self.equity_cfg.ml.model_id, model_version="unknown", timestamp=now.isoformat(), outputs={})
+                    chronos = self._chronos_forecasts(ticker, "equity", ohlc)
+                    if swing_outputs is not None:
+                        swing_timestamp, outputs = swing_outputs
+                        daily = direct_swing_forecasts(asset=ticker, model="model2_swing", model_version="swing-v1", timestamp=swing_timestamp, outputs=outputs)
+                        daily_by_horizon = {forecast.horizon: forecast for forecast in daily}
+                        forecasts = [
+                            combine_model_forecasts(
+                                [forecast, daily_by_horizon[forecast.horizon]]
+                                + ([chronos[forecast.horizon]] if forecast.horizon in chronos else [])
+                            )
+                            for forecast in forecasts
+                        ]
+                    else:
+                        forecasts = [combine_model_forecasts([forecast, chronos.get(forecast.horizon, forecast)]) for forecast in forecasts]
+                    state_db.replace_assistant_forecasts(conn, ticker, [item.as_dict() for item in forecasts])
                 except Exception:  # noqa: BLE001
                     print(f"[daemon] swing model2 inference failed for {ticker}:\n{traceback.format_exc()}")
             conn.commit()
         self._flush_notifications()
 
-    def _refresh_swing(self, conn, ticker: str, now: datetime) -> None:
+    def _refresh_swing(self, conn, ticker: str, now: datetime) -> tuple[str, dict[int, dict]] | None:
         swing = self.swing_cfg.swing
         checkpoint = Path(swing.model_dir) / f"{ticker.lower()}_swing.pt"
         if not checkpoint.exists():
-            return
+            return None
         if ticker not in self._swing_models:
             self._swing_models[ticker] = load_swing_model(checkpoint, swing)
         model = self._swing_models[ticker]
         dataset = build_swing_dataset(swing.market_cache_dir, ticker, swing.daily_lookback, swing.target_horizons, swing.macro_symbols)
         if len(dataset.timestamps) == 0:
-            return
+            return None
+        source_timestamp = pd.Timestamp(dataset.metadata.get("daily_data_end", dataset.timestamps[-1]))
+        if source_timestamp.tzinfo is None:
+            source_timestamp = source_timestamp.tz_localize("UTC")
         raw = model.predict(dataset.X_daily[-1:], dataset.X_entry[-1:], dataset.branch_mask[-1:])
         predictions = {f"expected_return_{h}d": float(raw["returns"][0, i]) for i, h in enumerate(HORIZONS)}
         predictions["expected_mfe"] = float(raw["mfe"][0])
@@ -395,10 +512,22 @@ class LiveDaemon:
         predictions["expected_duration_days"] = float(raw["duration"][0, -1])
         from core.ml.swing_model import swing_snapshot
 
-        snapshot = swing_snapshot(ticker, dataset.timestamps[-1], predictions, swing)
+        snapshot = swing_snapshot(ticker, source_timestamp, predictions, swing)
         self._write_snapshot(conn, ticker, "swing", snapshot, now)
         self._persist_strategy_profiles(conn, ticker, "equity", now)
-        if snapshot.swing_score is not None and snapshot.entry_score is not None and snapshot.swing_score > 80 and snapshot.entry_score > 80:
+        opportunity_score = float(scores_from_predictions({h: float(raw["returns"][0, index]) for index, h in enumerate(HORIZONS)}, float(raw["mfe"][0]), float(raw["mae"][0]), float(raw["entry"][0]), swing)[2])
+        public_outputs = {
+            horizon: {
+                "expected_return": float(raw["returns"][0, index]), "expected_mfe": float(raw["mfe"][0]),
+                "expected_mae": float(raw["mae"][0]), "expected_duration": float(raw["duration"][0, index]),
+                "opportunity_score": opportunity_score,
+            }
+            for index, horizon in enumerate(HORIZONS)
+        }
+        should_alert = snapshot.swing_score is not None and snapshot.entry_score is not None and snapshot.swing_score > 80 and snapshot.entry_score > 80
+        if not should_alert:
+            return source_timestamp.isoformat(), public_outputs
+        if should_alert:
             key = (ticker, snapshot.direction, f"{snapshot.swing_score:.2f}:{snapshot.entry_score:.2f}")
             if key not in self._notified_swing:
                 profile_row = conn.execute("SELECT aggressive_json FROM strategy_state WHERE asset = ?", (ticker,)).fetchone()
@@ -412,10 +541,13 @@ class LiveDaemon:
                     "entry": aggressive.get("entry_price"),
                     "stop": aggressive.get("stop_loss_price"),
                     "take_profit": aggressive.get("take_profit_price"),
-                    "knockout": aggressive.get("knockout_barrier_price"),
+                    "knockout": aggressive.get("knockout_barrier_price") or None,
+                    "protection_model": aggressive.get("protection_model"),
                     "leverage": aggressive.get("leverage"),
                 })
                 self._notified_swing.add(key)
+            forecast_timestamp = source_timestamp.isoformat()
+            return forecast_timestamp, public_outputs
 
     def _flush_notifications(self) -> None:
         pending, self._pending_notifications = self._pending_notifications, []
@@ -464,38 +596,134 @@ class LiveDaemon:
         conn.execute(
             "INSERT INTO signals (asset, model_type, timestamp, score, direction, expected_return, expected_duration_bars, "
             "expected_duration_days, expected_mfe, expected_mae, swing_score, entry_score, swing_opportunity_score, "
-            "alert_allowed, alert_reason, updated_at) VALUES (?,?,?,?,?,?,?,NULL,?,?,NULL,?,NULL,?,?,?) "
+            "alert_allowed, alert_reason, updated_at, model_version, data_timestamp, rule_score, forecast_score, "
+            "trade_quality_score, context_score, risk_score, combined_opportunity_score, strategy_state, context_status) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(asset, model_type) DO UPDATE SET timestamp=excluded.timestamp, score=excluded.score, "
             "direction=excluded.direction, expected_return=excluded.expected_return, "
             "expected_duration_bars=excluded.expected_duration_bars, expected_mfe=excluded.expected_mfe, "
             "expected_mae=excluded.expected_mae, entry_score=excluded.entry_score, alert_allowed=excluded.alert_allowed, "
-            "alert_reason=excluded.alert_reason, updated_at=excluded.updated_at",
+            "alert_reason=excluded.alert_reason, updated_at=excluded.updated_at, model_version=excluded.model_version, "
+            "data_timestamp=excluded.data_timestamp, rule_score=excluded.rule_score, forecast_score=excluded.forecast_score, "
+            "trade_quality_score=excluded.trade_quality_score, context_score=excluded.context_score, risk_score=excluded.risk_score, "
+            "combined_opportunity_score=excluded.combined_opportunity_score, strategy_state=excluded.strategy_state, context_status=excluded.context_status",
             (
                 asset, model_type, str(result["timestamp"]), result["score"],
                 result["direction"] if result["direction"] in {"LONG", "SHORT"} else "UNCERTAIN",
-                result["expected_return"], result["expected_duration"], result["expected_mfe"], result["expected_mae"],
-                result["entry_score"], int(result["score"] >= 80.0), "score >= 80" if result["score"] >= 80.0 else "",
-                now.isoformat(),
+                result["expected_return"], result["expected_duration"], None, result["expected_mfe"], result["expected_mae"],
+                None, result["entry_score"], None, int(result["score"] >= 80.0), "score >= 80" if result["score"] >= 80.0 else "",
+                now.isoformat(), result.get("model_version"), str(result.get("timestamp")) if result.get("timestamp") is not None else None, result.get("rule_score"),
+                result.get("forecast_score", result.get("score")), result.get("trade_quality_score"), result.get("context_score"),
+                result.get("risk_score"), result.get("combined_opportunity_score"), result.get("strategy_state"), result.get("context_status"),
             ),
         )
 
     # --- Hauptschleife -------------------------------------------------------------
+    def _latest_equity_session_date(self, now: pd.Timestamp) -> object:
+        """Return the newest completed/current regular US session date."""
+        ny = ZoneInfo("America/New_York")
+        market = self.market_states.state_at("SPY", now.to_pydatetime())
+        local = now.tz_convert(ny)
+        if market.session_type in {"REGULAR", "AFTER_HOURS"}:
+            return local.date()
+        candidate = local.date()
+        if market.is_trading_day and local.time() >= clock_time(16):
+            return candidate
+        candidate -= pd.Timedelta(days=1)
+        while not self.market_states.state_at("SPY", datetime.combine(candidate, clock_time(12), tzinfo=ny)).is_trading_day:
+            candidate -= pd.Timedelta(days=1)
+        return candidate
+
+    def _startup_freshness(self, forecast_rows, now: pd.Timestamp) -> tuple[list[str], set[str]]:
+        """Return stale rows and valid non-regular equity markets separately."""
+        ny = ZoneInfo("America/New_York")
+        latest_equity_session = self._latest_equity_session_date(now)
+        stale: list[str] = []
+        market_closed: set[str] = set()
+        for row in forecast_rows:
+            asset, horizon = row["asset"], row["horizon"]
+            if not row["forecast_timestamp"]:
+                stale.append(f"{asset} {horizon}: missing source timestamp")
+                continue
+            timestamp = pd.Timestamp(row["forecast_timestamp"])
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.tz_localize("UTC")
+            if asset in {"BTC/USDT", "ETH/USDT"}:
+                if now - timestamp > pd.Timedelta(hours=2):
+                    stale.append(f"{asset} {horizon}: source age {(now - timestamp).round('min')}")
+                continue
+            market = self.market_states.state_at(asset, now.to_pydatetime())
+            source_local = timestamp.tz_convert(ny)
+            source_session = timestamp.date() if row["timeframe"] == "1d" else source_local.date()
+            if source_session != latest_equity_session:
+                stale.append(f"{asset} {horizon}: source session {source_session} != {latest_equity_session}")
+                continue
+            if market.session_type == "REGULAR":
+                if now - timestamp > pd.Timedelta(hours=2):
+                    stale.append(f"{asset} {horizon}: source age {(now - timestamp).round('min')}")
+            else:
+                market_closed.add(asset)
+        return stale, market_closed
+
+    def _refresh_runtime_status(self) -> str:
+        """Evaluate persisted matrices after startup or a completed signal refresh."""
+        with state_db.connect() as conn:
+            counts = dict(conn.execute("SELECT asset, COUNT(*) FROM assistant_forecasts GROUP BY asset").fetchall())
+            forecast_rows = conn.execute("SELECT asset, horizon, timeframe, forecast_timestamp FROM assistant_forecasts").fetchall()
+        missing = [asset for asset in ASSISTANT_ASSETS if counts.get(asset, 0) != 9]
+        if missing:
+            detail = f"Missing complete forecast matrices: {', '.join(missing)}"
+            state_db.set_runtime_status("DEGRADED", detail)
+            return "DEGRADED"
+        stale, market_closed = self._startup_freshness(forecast_rows, pd.Timestamp.now(tz="UTC"))
+        if stale:
+            detail = "STALE_SOURCE_DATA: " + "; ".join(stale[:4])
+            state_db.set_runtime_status("DEGRADED", detail)
+            return "DEGRADED"
+        detail = "Live data, context, risk profiles, and forecast matrices initialized."
+        if market_closed:
+            detail += f" MARKET_CLOSED: {', '.join(sorted(market_closed))}."
+        state_db.set_runtime_status("READY", detail)
+        return "READY"
+
+    def initialize(self) -> str:
+        """Synchronously build a current, GUI-ready state before polling begins."""
+        state_db.set_runtime_status("INITIALIZING", "Refreshing market history, context, models, and forecasts.")
+        try:
+            self.price_tick()
+            self.signal_refresh(force_refresh=True)
+            status = self._refresh_runtime_status()
+            self._last_signal_refresh = time.monotonic()
+            return status
+        except Exception as exc:  # noqa: BLE001 - startup must expose failure state without crashing the loop
+            detail = f"DATA_SOURCE_ERROR: {type(exc).__name__}: {exc}"
+            state_db.set_runtime_status("DATA_UNAVAILABLE", detail)
+            return "DATA_UNAVAILABLE"
+
+    def run_cycle(self, *, force_signal: bool = False) -> str:
+        """Run one order-free live cycle; used by the loop and accelerated tests."""
+        try:
+            self.price_tick()
+        except Exception:  # noqa: BLE001 - preserve loop resilience per cycle
+            state_db.set_runtime_status("DEGRADED", "DATA_SOURCE_ERROR: price refresh failed")
+            return "DEGRADED"
+        if force_signal or time.monotonic() - self._last_signal_refresh >= SIGNAL_REFRESH_S:
+            try:
+                self.signal_refresh(force_refresh=force_signal)
+                self._last_signal_refresh = time.monotonic()
+                return self._refresh_runtime_status()
+            except Exception:  # noqa: BLE001 - provider/model failure must remain explicit
+                state_db.set_runtime_status("DEGRADED", "DATA_SOURCE_ERROR: signal refresh failed")
+                return "DEGRADED"
+        return "READY"
+
     def run_forever(self) -> None:
         print(f"Live daemon starting, DB={state_db.DB_PATH}")
+        print(f"Startup status: {self.initialize()}")
         try:
             while True:
                 loop_start = time.monotonic()
-                try:
-                    self.price_tick()
-                except Exception:  # noqa: BLE001
-                    print(f"[daemon] price_tick failed:\n{traceback.format_exc()}")
-
-                if time.monotonic() - self._last_signal_refresh >= SIGNAL_REFRESH_S:
-                    try:
-                        self.signal_refresh()
-                    except Exception:  # noqa: BLE001
-                        print(f"[daemon] signal_refresh failed:\n{traceback.format_exc()}")
-                    self._last_signal_refresh = time.monotonic()
+                self.run_cycle()
 
                 elapsed = time.monotonic() - loop_start
                 time.sleep(max(0.0, PRICE_POLL_S - elapsed))

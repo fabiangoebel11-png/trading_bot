@@ -110,15 +110,25 @@ def fetch_ohlcv_history(
     if all_ohlcv:
         earliest_cached = min(all_ohlcv)
         latest_cached = max(all_ohlcv)
-        # A short recent cache (the observed 45-day 1h failure) is missing the
-        # historical prefix, so restart at the requested beginning. Otherwise
-        # continue after the cached tail for normal incremental updates.
-        since = since if earliest_cached > since + timeframe_ms else latest_cached + timeframe_ms
+        # A short recent cache is missing useful model history and must be
+        # backfilled from the requested start. A substantial cache can begin
+        # after an exchange product's listing date; restarting at that
+        # unavailable prefix only returns duplicates and prevents a live tail
+        # refresh. Continue such a seed from its newest candle.
+        seed_coverage = len(all_ohlcv) / max(target_candles, 1)
+        since = since if earliest_cached > since + timeframe_ms and seed_coverage < 0.8 else latest_cached + timeframe_ms
     consecutive_failures = 0
 
-    while since <= int(requested_end.timestamp() * 1000) and len(all_ohlcv) < target_candles:
+    requested_end_ms = int(requested_end.timestamp() * 1000)
+    while since <= requested_end_ms and (
+        len(all_ohlcv) < target_candles
+        or (all_ohlcv and max(all_ohlcv) < requested_end_ms - timeframe_ms)
+    ):
         try:
-            limit = min(1000, target_candles - len(all_ohlcv))
+            # A complete but stale seed still needs one tail page.  Without
+            # this floor, ``target_candles - len(all_ohlcv)`` becomes zero and
+            # CCXT receives a no-op request despite a valid newer ``since``.
+            limit = min(1000, max(1, target_candles - len(all_ohlcv)))
             batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
             if not batch:
                 break
@@ -187,7 +197,8 @@ def drop_incomplete_last_candle(df: pd.DataFrame, timeframe: str) -> pd.DataFram
         return df
     candle_duration = pd.Timedelta(timeframe)
     last_close_time = df.index[-1] + candle_duration
-    now = pd.Timestamp.utcnow().tz_localize(None)
+    index_timezone = getattr(df.index, "tz", None)
+    now = pd.Timestamp.now(tz=index_timezone) if index_timezone is not None else pd.Timestamp.now()
     return df.iloc[:-1] if now < last_close_time else df
 
 

@@ -24,6 +24,13 @@ from core.ml.data import load_ohlcv_parquet, normalize_ohlcv, save_ohlcv_parquet
 load_dotenv()
 
 TWELVE_DATA_MAX_INTRADAY_DAYS = 365
+_CACHE_MAX_AGE = {
+    "5m": pd.Timedelta(minutes=15),
+    "15m": pd.Timedelta(minutes=35),
+    "1h": pd.Timedelta(hours=2),
+    "4h": pd.Timedelta(hours=8),
+    "1d": pd.Timedelta(hours=36),
+}
 
 
 def _history_days_for(config, definition: dict[str, object], timeframe: str) -> int:
@@ -118,12 +125,13 @@ class ParquetProvider:
 
 
 class CCXTHistoricalProvider:
-    def __init__(self, cache_dir: str, exchange_id: str = "binance", market_type: str = "swap") -> None:
+    def __init__(self, cache_dir: str, exchange_id: str = "binance", market_type: str = "swap", max_cache_age: pd.Timedelta = pd.Timedelta(days=2)) -> None:
         self.cache_dir = cache_dir
         self.exchange_id = exchange_id
         self.market_type = market_type
         self.last_report: dict[str, object] = {}
         self.seed_frame: pd.DataFrame | None = None
+        self.max_cache_age = max_cache_age
 
     def load(self, asset: AssetSpec) -> pd.DataFrame:
         cache_path = canonical_cache_path(self.cache_dir, asset)
@@ -133,7 +141,7 @@ class CCXTHistoricalProvider:
             requested_start = pd.Timestamp(asset.history_start, tz="UTC") if asset.history_start else pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=asset.history_days)
             if (
                 not cached.empty
-                and cached.index.max() >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=2)
+                and cached.index.max() >= pd.Timestamp.now(tz="UTC") - self.max_cache_age
                 and cached.index.min() <= requested_start + pd.Timedelta(days=2)
             ):
                 self.last_report = {"status": "success", "requested_start": (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=asset.history_days)).isoformat(), "requested_end": pd.Timestamp.now(tz="UTC").isoformat()}
@@ -349,11 +357,11 @@ class YFinanceHistoricalProvider:
         return normalized
 
 
-def provider_for(name: str, *, cache_dir: str, exchange_id: str = "binance", market_type: str = "swap", twelve_data_settings: dict[str, object] | None = None) -> HistoricalProvider:
+def provider_for(name: str, *, cache_dir: str, exchange_id: str = "binance", market_type: str = "swap", twelve_data_settings: dict[str, object] | None = None, max_cache_age: pd.Timedelta = pd.Timedelta(days=2)) -> HistoricalProvider:
     if name == "parquet":
         return ParquetProvider()
     if name == "ccxt":
-        return CCXTHistoricalProvider(cache_dir, exchange_id, market_type)
+        return CCXTHistoricalProvider(cache_dir, exchange_id, market_type, max_cache_age)
     if name == "eodhd":
         return EODHDHistoricalProvider()
     if name == "twelve_data":
@@ -397,6 +405,7 @@ def prepare_asset_specs(
     exchange_id: str = "binance",
     default_market_type: str = "swap",
     twelve_data_settings: dict[str, object] | None = None,
+    force_refresh: bool = False,
 ) -> tuple[dict[str, pd.DataFrame], list[dict[str, object]]]:
     """Load, validate, and persist configured assets without proxy substitution."""
     from core.ml.data import quality_report, save_ohlcv_parquet
@@ -412,14 +421,15 @@ def prepare_asset_specs(
                 exchange_id=exchange_id,
                 market_type=spec.market_type or default_market_type,
                 twelve_data_settings=twelve_data_settings,
+                max_cache_age=_CACHE_MAX_AGE.get(spec.timeframe, pd.Timedelta(hours=2)),
             )
             canonical_is_fresh = False
             if path.exists():
                 frame = load_ohlcv_parquet(path)
                 requested_start = pd.Timestamp(spec.history_start, tz="UTC") if spec.history_start else pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=spec.history_days)
-                canonical_is_fresh = (
+                canonical_is_fresh = not force_refresh and (
                     not frame.empty
-                    and frame.index.max() >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=2)
+                    and frame.index.max() >= pd.Timestamp.now(tz="UTC") - _CACHE_MAX_AGE.get(spec.timeframe, pd.Timedelta(hours=2))
                     and frame.index.min() <= requested_start + pd.Timedelta(days=2)
                 )
             if not canonical_is_fresh:
@@ -427,8 +437,12 @@ def prepare_asset_specs(
                     base_key = f"{spec.name}:5m"
                     base = loaded.get(base_key)
                     if base is None:
-                        base_path = canonical_cache_path(cache_root, AssetSpec(spec.name, spec.symbol, "twelve_data", "5m", spec.history_days, source=spec.source))
-                        if not base_path.exists():
+                        base_paths = [
+                            canonical_cache_path(cache_root, AssetSpec(spec.name, spec.symbol, provider_name, "5m", spec.history_days, source=spec.source))
+                            for provider_name in ("twelve_data", "yfinance", "ccxt")
+                        ]
+                        base_path = next((candidate for candidate in base_paths if candidate.exists()), None)
+                        if base_path is None:
                             raise RuntimeError(f"Cannot derive {spec.timeframe}: missing 5m source for {spec.name}")
                         base = load_ohlcv_parquet(base_path)
                     rule = {"15m": "15min", "1h": "1h", "4h": "4h"}.get(spec.timeframe)

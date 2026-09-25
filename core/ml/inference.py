@@ -49,8 +49,18 @@ def load_symbol_model(symbol: str, config: TrendMLConfig) -> tuple[TCNTrendModel
         num_layers=meta.get("num_layers", config.num_layers),
         dropout=meta.get("dropout", config.dropout),
     )
-    model = TCNTrendModel(arch_config, n_features=state["n_features"])
+    horizons = tuple(int(h) for h in meta.get("label_config", {}).get("forecast_horizons", meta.get("forecast_horizons", getattr(config, "forecast_horizons", (int(config.label_horizon),)))))
+    arch_config = dataclasses.replace(arch_config, forecast_horizons=horizons)
+    state = dict(state)
+    if "forecast_horizons" not in state:
+        state["forecast_horizons"] = list(horizons)
+    if "horizon_target_scales" not in state and meta.get("horizon_target_scales"):
+        state["horizon_target_scales"] = meta["horizon_target_scales"]
+    if "horizon_duration_active" not in state and meta.get("horizon_duration_active"):
+        state["horizon_duration_active"] = meta["horizon_duration_active"]
+    model = TCNTrendModel(arch_config, n_features=state["n_features"], forecast_horizons=horizons, prefer_cuda=False, asset=symbol)
     model.load_state_dict(state)
+    model.to_cpu()
     return model, meta
 
 

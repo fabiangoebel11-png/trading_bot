@@ -38,7 +38,13 @@ def load_config(path: str | Path) -> TradingBotConfig:
         if section == "seed":
             config.ml.random_state = int(values)
         elif hasattr(config, section):
-            _apply_section(getattr(config, section), values)
+            target = getattr(config, section)
+            if isinstance(target, (str, int, float, bool)) or not hasattr(target, "__dataclass_fields__"):
+                setattr(config, section, values)
+            elif isinstance(values, dict):
+                _apply_section(target, values)
+            else:
+                raise ValueError(f"Configuration section {section!r} expects a mapping of dataclass fields, got {type(values).__name__}")
         else:
             raise ValueError(f"Unknown configuration section: {section}")
     return config

@@ -12,14 +12,14 @@ Manuelle Installation:
 
 1. **Umgebung installieren:**
 	```powershell
-	uv venv
-	uv pip install -e .
+	uv venv --python 3.12
+	uv sync --python .\.venv\Scripts\python.exe --extra ml --group dev
 	```
-	Auf CPU-only-Laptops zusätzlich installieren: `uv pip install torch --index-url https://download.pytorch.org/whl/cpu`.
+	Das Projekt verwendet explizit den offiziellen CUDA-124-PyTorch-Index via `tool.uv.sources` fuer `torch`. `torchvision` und `torchaudio` werden im TCN-Setup nicht verwendet und sind nicht Bestandteil des `ml`-Extras.
 3. **Konfiguration anlegen:** `Copy-Item .env.example .env` und die lokalen Credentials in `.env` eintragen. Die echte `.env` wird nie versioniert.
-4. **Starten:** `.\start.ps1` öffnet Daemon, Paper-Broker und Streamlit-GUI in separaten Fenstern. Die GUI ist danach unter `http://localhost:8501` erreichbar.
+4. **Starten:** `./start.ps1` öffnet Daemon, Paper-Broker und Streamlit-GUI in separaten Fenstern. Die GUI ist danach unter `http://localhost:8501` erreichbar.
 
-`start.bat` erzwingt über `TRADING_BOT_FORCE_CPU=1` CPU-Inferenz. Der zentrale Device-Resolver fällt außerdem automatisch auf CPU zurück, wenn keine CUDA-fähige GPU verfügbar ist. `core.ml.device` meldet beim Daemon-Start `Inference Device: CUDA` oder `Inference Device: CPU`. Das Startskript startet einen beendeten Prozess nach 10 Sekunden erneut. Zum Beenden das jeweilige Prozessfenster schließen.
+`start.bat` erzwingt über `TRADING_BOT_FORCE_CPU=1` CPU-Inferenz. Der normale Produktionsstart bleibt CPU-first. Training verwendet `training_device: cuda` und bricht hart ab, wenn CUDA nicht verfügbar ist. `core.ml.device` meldet beim Daemon-Start `Inference Device: CUDA` oder `Inference Device: CPU`. Das Startskript startet einen beendeten Prozess nach 10 Sekunden erneut. Zum Beenden das jeweilige Prozessfenster schließen.
 
 ## Repository-Inhalt und Modelle
 

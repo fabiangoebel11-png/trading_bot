@@ -21,6 +21,28 @@ def test_prepared_context_symbols_are_configured_for_ml() -> None:
     assert {"^VIX", "^TNX", "EURUSD=X", "GC=F", "CL=F", "^GDAXI"} <= set(config.ml.macro_symbols)
 
 
+def test_training_tcn_crypto_1h_yaml_loads_conservative_cuda_diagnostics() -> None:
+    config = load_config("configs/training_tcn_crypto_1h.yaml")
+    assert config.training_device == "cuda"
+    assert config.inference_device == "cpu"
+    assert config.ml.model_id == "tcn_crypto_1h"
+    assert config.ml.batch_size == 2048
+    assert config.ml.learning_rate == 0.0003
+    assert config.ml.use_amp is False
+    assert config.ml.gradient_clip_norm == 1.0
+    assert tuple(config.ml.forecast_horizons) == (1, 4, 8, 12, 24)
+    assert config.ml.sequence_length == 128
+    assert config.ml.hidden_channels == 96
+    assert config.ml.num_layers == 6
+    assert config.ml.dropout == 0.35
+
+
+def test_training_crypto_intraday_yaml_uses_multi_horizon_contract() -> None:
+    config = load_config("configs/training_crypto_intraday.yaml")
+    assert config.ml.label_horizon == 1
+    assert tuple(config.ml.forecast_horizons) == (1, 4, 8, 12, 24)
+
+
 def test_5m_feature_matrix_includes_all_higher_timeframes_and_macro() -> None:
     config = TradingBotConfig()
     config.ml.base_timeframe = "5m"

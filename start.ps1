@@ -1,6 +1,8 @@
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$env:TRADING_BOT_FORCE_CPU = "1"
+$env:TRADING_BOT_INFERENCE_DEVICE = "cpu"
 
 if (-not (Test-Path -LiteralPath $Python)) {
     throw "Python virtual environment not found at $Python. Create it and install the project first."
