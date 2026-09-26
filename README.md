@@ -19,11 +19,28 @@ Manuelle Installation:
 3. **Konfiguration anlegen:** `Copy-Item .env.example .env` und die lokalen Credentials in `.env` eintragen. Die echte `.env` wird nie versioniert.
 4. **Starten:** `./start.ps1` öffnet Daemon, Paper-Broker und Streamlit-GUI in separaten Fenstern. Die GUI ist danach unter `http://localhost:8501` erreichbar.
 
-`start.bat` erzwingt über `TRADING_BOT_FORCE_CPU=1` CPU-Inferenz. Der normale Produktionsstart bleibt CPU-first. Training verwendet `training_device: cuda` und bricht hart ab, wenn CUDA nicht verfügbar ist. `core.ml.device` meldet beim Daemon-Start `Inference Device: CUDA` oder `Inference Device: CPU`. Das Startskript startet einen beendeten Prozess nach 10 Sekunden erneut. Zum Beenden das jeweilige Prozessfenster schließen.
+## Ordnerübersicht
+
+- Im Root liegen die Windows-Startskripte, `app.py`, die Daemon-/Broker-Einstiegspunkte und gemeinsam importierte Runtime-Module.
+- `core/` und `execution/` enthalten Engine und Ausführungslogik; `configs/` enthält YAML-Konfigurationen.
+- `research/training/` enthält die modellbezogenen Trainingsstarter; `research/diagnostics/` enthält einmalige Diagnoseprogramme.
+- `docs/reports/` und `docs/archive/` enthalten Audit-Ausgaben und historische Übergaben.
+- `scripts/manual/` enthält manuelle Telegram-/Testnet-Prüfungen. Der Bybit-Test kann eine Testnet-Order platzieren und wieder stornieren.
+- `data/` und `training_logs/` sind für lokale Datenbanken, Caches und Ausgaben; diese Dateien gehören nicht in einen Source-Commit.
+
+Modellspezifische Trainingsstarter werden vom Repository-Root aus aufgerufen:
+
+```powershell
+.\.venv\Scripts\python.exe research\training\train_crypto_intraday.py
+.\.venv\Scripts\python.exe research\training\train_equity_intraday.py
+.\.venv\Scripts\python.exe research\training\train_swing.py --train
+```
+
+Der Produktionsstart setzt die Daemon-/GUI-Inferenz weiterhin explizit auf CPU; der globale Override `TRADING_BOT_FORCE_CPU` wird nicht mehr gesetzt, damit ein separater Trainingsprozess CUDA verwenden kann. Training verwendet `training_device: cuda` und bricht hart ab, wenn CUDA nicht verfügbar ist. `core.ml.device` meldet beim Daemon-Start `Inference Device: CUDA` oder `Inference Device: CPU`. Das Startskript startet einen beendeten Prozess nach 10 Sekunden erneut. Zum Beenden das jeweilige Prozessfenster schließen.
 
 ## Repository-Inhalt und Modelle
 
-Runtime-Daten, Markt-Caches, Datenbanken, Logs und Credentials sind per `.gitignore` ausgeschlossen. Die vorhandenen PyTorch-Checkpoints sind zusammen etwa 14,45 MB groß und bleiben deshalb zunächst als normale Git-Dateien versionierbar. Falls sie wachsen, sollten sie über Git LFS oder als GitHub-Release-Artefakte verteilt werden. Ohne Checkpoints müssen die Modelle vor dem Betrieb neu trainiert oder manuell bereitgestellt werden.
+Runtime-Daten, Markt-Caches, Datenbanken, Logs, Credentials und trainierte Checkpoints bleiben lokal und sind per `.gitignore` ausgeschlossen. Checkpoints müssen bei Bedarf separat bereitgestellt oder neu trainiert werden; sie gehören nicht zum Source-Commit.
 
 ## ML Training Pipeline
 

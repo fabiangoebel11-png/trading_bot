@@ -18,6 +18,20 @@ def torch_available() -> bool:
     return torch is not None
 
 
+def cuda_available() -> bool:
+    """Return whether CUDA is available and can be initialized by PyTorch."""
+    if torch is None:
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        torch.cuda.init()
+        torch.cuda.current_device()
+        return True
+    except (AssertionError, RuntimeError):
+        return False
+
+
 def _normalize_requested_device(requested_device: str | None) -> str | None:
     if requested_device is None:
         return None
@@ -49,11 +63,15 @@ def resolve_device(requested_device: str | None = None, *, prefer_cuda: bool = T
     if requested == "cpu":
         return torch.device("cpu")
     if requested == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required for training_device='cuda' but CUDA is not available in this environment.")
+        if not cuda_available():
+            cuda_version = getattr(torch.version, "cuda", None)
+            raise RuntimeError(
+                "CUDA is required for training_device='cuda' but CUDA is not available in this environment "
+                f"(torch={torch.__version__}, torch_cuda={cuda_version!r})."
+            )
         torch.backends.cudnn.benchmark = True
         return torch.device("cuda")
-    if prefer_cuda and torch.cuda.is_available():
+    if prefer_cuda and cuda_available():
         torch.backends.cudnn.benchmark = True
         return torch.device("cuda")
     return torch.device("cpu")

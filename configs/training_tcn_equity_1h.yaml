@@ -1,0 +1,46 @@
+data:
+  symbols: ["NASDAQ100_PROXY", "SP500_PROXY"]
+  market_type: "equity_index"
+  base_timeframe: "1h"
+ml:
+  enabled: false
+  model_id: "tcn_equity_1h"
+  model_role: "FORECAST"
+  production_timeframe: "1h"
+  base_timeframe: "1h"
+  forecast_horizons: [72]
+  context_required: true
+  context_feature_version: "context-v1"
+  assets: ["NASDAQ100_PROXY", "SP500_PROXY"]
+  optional_assets: []
+  model_dir: "data/models/model1b_equity"
+  market_cache_dir: "data/market"
+  market_assets:
+    NASDAQ100_PROXY:
+      provider: "yfinance"
+      provider_by_timeframe: {"5m": "twelve_data", "1d": "yfinance"}
+      provider_symbols: {"twelve_data": "QQQ", "yfinance": "QQQ"}
+      symbol: "QQQ"
+      market_type: "equity_index"
+      derive_from: "5m"
+      session_timezone: "America/New_York"
+      history_days_by_timeframe: {"5m": 365, "15m": 365, "1h": 365, "4h": 365, "1d": 14600}
+    SP500_PROXY:
+      provider: "yfinance"
+      provider_by_timeframe: {"5m": "twelve_data", "1d": "yfinance"}
+      provider_symbols: {"twelve_data": "SPY", "yfinance": "SPY"}
+      symbol: "SPY"
+      market_type: "equity_index"
+      derive_from: "5m"
+      session_timezone: "America/New_York"
+      history_days_by_timeframe: {"5m": 365, "15m": 365, "1h": 365, "4h": 365, "1d": 14600}
+  timeframes: ["5m", "15m", "1h", "4h", "1d"]
+  timeframe_history_days: {"5m": 365, "15m": 365, "1h": 365, "4h": 365, "1d": 14600}
+  higher_timeframes: ["4h", "1d"]
+  macro_symbols: ["GC=F", "^VIX", "^TNX", "EURUSD=X", "CL=F", "^GDAXI", "ES=F", "NQ=F"]
+  macro_lookback_days: 2600
+  context_timeframes: ["1d"]
+  train_end: "2024-12-31 23:59:59"
+  validation_start: "2025-01-01 00:00:00"
+  validation_end: "2025-12-31 23:59:59"
+  test_start: "2026-01-01 00:00:00"

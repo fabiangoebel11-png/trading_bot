@@ -33,6 +33,62 @@ from core.ml.tcn_model import TCNTrendModel
 from core.strategy import compute_atr
 
 
+LIVE_SAFE_BASE_FEATURES = (
+    *(f"log_ret_{lag}" for lag in (1, 3, 6, 12, 24, 48)),
+    *(f"realized_vol_{window}" for window in (12, 48, 288)),
+    "atr_pct",
+    "ema_fast_dist",
+    "ema_slow_dist",
+    "ema_regime",
+    "donchian_upper_dist",
+    "donchian_lower_dist",
+    "donchian_exit_upper_dist",
+    "donchian_exit_lower_dist",
+    "rsi_14",
+    "volume_zscore",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+)
+
+
+def live_safe_feature_columns(config: TrendMLConfig) -> tuple[str, ...]:
+    """Return the closed-world feature contract shared by training and live inference."""
+    columns = list(LIVE_SAFE_BASE_FEATURES)
+    for rule in config.higher_timeframes or ():
+        if rule not in {"15m", "1h", "4h", "1d"}:
+            raise ValueError(f"unsupported live-safe higher timeframe: {rule!r}")
+        prefix = f"htf_{rule}_"
+        columns.extend(
+            f"{prefix}{name}"
+            for name in (
+                "ema_regime",
+                "ema_fast_dist",
+                "atr_pct",
+                "donchian_upper_dist",
+                "donchian_lower_dist",
+                "rsi_14",
+            )
+        )
+    configured = config.feature_columns
+    if configured is not None and tuple(configured) != tuple(columns):
+        raise ValueError("feature_columns must exactly match the live-safe feature contract")
+    return tuple(columns)
+
+
+def enforce_live_safe_feature_set(features: pd.DataFrame, config: TrendMLConfig) -> pd.DataFrame:
+    """Reject missing contract columns and discard non-live-safe context."""
+    allowed = live_safe_feature_columns(config)
+    missing = sorted(set(allowed).difference(features.columns))
+    if missing:
+        raise ValueError(f"live-safe feature contract missing columns: {missing}")
+    selected = features.loc[:, list(allowed)].copy()
+    if np.isinf(selected.to_numpy(dtype=np.float64)).any():
+        raise ValueError("live-safe feature contract produced infinite values")
+    return selected
+
+
 def resolve_forecast_horizons(config: TrendMLConfig) -> tuple[int, ...]:
     """Normalize the configured forecast horizon list without breaking older single-horizon configs."""
     raw = getattr(config, "forecast_horizons", None)
@@ -102,7 +158,10 @@ def _prepare_symbol_dataset(
     breadth_return: pd.Series | None = None,
     forecast_horizons: tuple[int, ...] | None = None,
 ):
-    features = build_feature_matrix(ohlc, macro_prices, config, breadth_return)
+    features = enforce_live_safe_feature_set(
+        build_feature_matrix(ohlc, macro_prices, config, breadth_return),
+        config,
+    )
     atr = compute_atr(ohlc["high"], ohlc["low"], ohlc["close"], config.atr_window)
     horizons = resolve_forecast_horizons(config) if forecast_horizons is None else tuple(int(h) for h in forecast_horizons)
     label_map = build_horizon_label_map(
@@ -407,6 +466,7 @@ def train_symbol_model(
     diagnostic_only: bool = False,
 ) -> dict:
     horizons = resolve_forecast_horizons(config)
+    feature_contract = live_safe_feature_columns(config)
     print(f"\n=== {symbol}: building features + triple-barrier labels (horizons={horizons}) ===")
     X, y, t1_pos, mfe, mae, horizon_labels = _prepare_symbol_dataset(ohlc, macro_prices, config, breadth_return, forecast_horizons=horizons)
     X_seq, y_seq, t1_seq, index_seq, mfe_seq, mae_seq = _to_sequences(X, y, t1_pos, config.sequence_length, mfe, mae)
@@ -625,6 +685,13 @@ def train_symbol_model(
         "assets": config.assets,
         "timeframes": config.timeframes,
         "feature_columns": list(X.columns),
+        "feature_set_id": "live_safe_local_v1",
+        "feature_contract": {
+            "name": "live_safe_local_v1",
+            "columns": list(feature_contract),
+            "excludes": ["macro", "breadth", "network_fetched_context"],
+            "latency_budget_seconds": 5,
+        },
         "sequence_length": config.sequence_length,
         # Architecture hyperparameters actually used to train THIS checkpoint
         # -- persisted so ``core/ml/inference.py: load_symbol_model`` can

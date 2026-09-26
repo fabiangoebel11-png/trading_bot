@@ -106,7 +106,7 @@ def test_tcn_router_does_not_fallback_to_primary_head(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("asset,internal", [("SPY", "SP500_PROXY"), ("QQQ", "NASDAQ100_PROXY")])
-def test_equity_proxy_model_keeps_public_asset(monkeypatch, asset: str, internal: str) -> None:
+def test_equity_intraday_tcn_is_disabled(monkeypatch, asset: str, internal: str) -> None:
     calls = []
     _patch_fake_tcn(monkeypatch, internal)
     monkeypatch.setattr(model_integration, "load_symbol_model", lambda symbol, _config: (calls.append(symbol) or (_FakeHorizonModel(), {"feature_columns": ["feature"], "sequence_length": 4, "model_version": "test"})))
@@ -115,10 +115,9 @@ def test_equity_proxy_model_keeps_public_asset(monkeypatch, asset: str, internal
         asset, "1h", _frame(), horizon="4h", category="INTRADAY", model_root=None
     )
 
-    assert forecast.status == "AVAILABLE"
-    assert forecast.asset == asset
-    assert calls == [internal]
-    assert internal in forecast.model_id
+    assert forecast.status == "MODEL_UNAVAILABLE"
+    assert "TCN is disabled" in forecast.reason
+    assert calls == []
     assert forecast.as_dict()["asset"] == asset
 
 

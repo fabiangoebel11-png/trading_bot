@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - exercised on minimal environments
     yaml = None
 
 from core.config import TradingBotConfig
-from core.ml.train import load_ml_ohlc, run_training_pipeline
+from core.ml.train import load_ml_ohlc, live_safe_feature_columns, run_training_pipeline
 from core.ml.providers import TwelveDataHistoricalProvider, asset_specs_from_config, prepare_asset_specs
 
 
@@ -66,6 +66,7 @@ def print_training_summary(config: TradingBotConfig) -> None:
     print(f"Test: {ml.test_start} -> {ml.test_end}")
     print(f"Calibration: {ml.calibration_method}; baselines: {ml.baseline_logistic_enabled}/{ml.baseline_gradient_boosting_enabled}")
     print(f"Score thresholds: {ml.score_thresholds}")
+    print(f"Feature contract: live_safe_local_v1 ({len(live_safe_feature_columns(ml))} columns; local OHLCV/HTF only; <=5s live budget)")
     print("Training samples and class distribution are printed after each configured dataset is prepared.")
 
 

@@ -5,7 +5,7 @@ import pandas as pd
 
 from core.config import SwingMLConfig
 from core.ml.swing_data import build_swing_dataset
-from core.ml.swing_model import combine_scores
+from core.ml.swing_model import combine_scores, horizon_opportunity_score
 from core.risk import cap_model2_leverage
 
 
@@ -49,3 +49,12 @@ def test_model2_config_defaults() -> None:
     assert config.assets == ["QQQ", "SPY"]
     assert config.target_horizons == [1, 3, 5, 10, 20]
     assert config.max_model2_leverage == 10.0
+
+
+def test_swing_horizon_score_changes_with_horizon_forecast() -> None:
+    config = SwingMLConfig()
+    short_horizon = horizon_opportunity_score(0.001, 0.01, -0.006, 0.3, config)
+    longer_horizon = horizon_opportunity_score(0.012, 0.05, -0.02, 0.6, config)
+    assert short_horizon != longer_horizon
+    assert 0.0 <= short_horizon <= 100.0
+    assert 0.0 <= longer_horizon <= 100.0

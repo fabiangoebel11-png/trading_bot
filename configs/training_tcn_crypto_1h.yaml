@@ -1,0 +1,43 @@
+data:
+  symbols: ["BTC/USDT", "ETH/USDT"]
+  market_type: "swap"
+  base_timeframe: "1h"
+
+training_device: "cuda"
+inference_device: "cpu"
+
+ml:
+  enabled: false
+  model_id: "tcn_crypto_1h"
+  model_role: "FORECAST"
+  production_timeframe: "1h"
+  base_timeframe: "1h"
+  label_horizon: 1
+  forecast_horizons: [1, 4, 8, 12, 24]
+  context_required: true
+  context_feature_version: "context-v1"
+  assets: ["BTC/USDT", "ETH/USDT"]
+  model_dir: "data/models/tcn_crypto_1h"
+  market_cache_dir: "data/market"
+  timeframes: ["1h", "4h", "1d"]
+  higher_timeframes: ["4h", "1d"]
+  macro_symbols: ["GC=F", "^VIX", "^TNX", "EURUSD=X", "CL=F", "^GDAXI", "ES=F", "NQ=F"]
+  macro_lookback_days: 2600
+  context_timeframes: ["1d"]
+  train_end: "2025-12-31 23:59:59"
+  validation_start: "2026-01-01 00:00:00"
+  validation_end: "2026-05-31 23:59:59"
+  test_start: "2026-06-01 00:00:00"
+  test_end: "2026-09-22 23:59:59"
+  sequence_length: 128
+  hidden_channels: 96
+  num_layers: 6
+  dropout: 0.45
+  learning_rate: 0.0001
+  batch_size: 2048
+  max_epochs: 80
+  early_stopping_patience: 6
+  use_amp: false
+  gradient_clip_norm: 1.0
+  training_device: "cuda"
+  inference_device: "cpu"

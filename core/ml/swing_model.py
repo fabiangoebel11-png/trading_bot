@@ -42,6 +42,27 @@ def combine_scores(swing_score: float, entry_score: float, swing_weight: float =
     return bounded_score((swing_weight * swing_score + entry_weight * entry_score) / total)
 
 
+def horizon_opportunity_score(expected_return: float, expected_mfe: float, expected_mae: float, entry_signal: float, config: SwingMLConfig) -> float:
+    """Score one swing forecast from its own horizon-specific trade quality.
+
+    Each swing horizon already exposes a dedicated expected return plus its
+    favorable and adverse excursion tails. The score therefore combines:
+    - directional confidence: expected return relative to the horizon's MFE/MAE
+    - payoff quality: favorable vs adverse excursion balance
+    - entry conviction: the model's directional entry signal
+
+    This keeps the score transparent and horizon-specific without altering the
+    underlying Model-2 architecture or requiring retraining.
+    """
+    favorable = max(float(expected_mfe), 0.0)
+    adverse = max(-float(expected_mae), 0.0)
+    directional_confidence = np.clip(abs(float(expected_return)) / max(favorable + adverse + 1e-8, 1e-8), 0.0, 1.0)
+    payoff = favorable / max(favorable + adverse, 1e-8)
+    entry_strength = np.clip((float(entry_signal) + 1.0) / 2.0, 0.0, 1.0)
+    score = 100.0 * (0.55 * directional_confidence + 0.25 * payoff + 0.20 * entry_strength)
+    return bounded_score(score)
+
+
 def scores_from_predictions(expected_returns: dict[int, float], expected_mfe: float, expected_mae: float, entry_signal: float, config: SwingMLConfig) -> tuple[float, float, float]:
     return_signal = float(np.mean([expected_returns.get(h, 0.0) for h in HORIZONS]))
     quality = return_signal + 0.5 * expected_mfe + 0.5 * expected_mae

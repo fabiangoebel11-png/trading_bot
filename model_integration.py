@@ -22,7 +22,7 @@ from core.ml.features import build_feature_matrix
 from core.ml.inference import load_symbol_model
 from core.ml.scoring import continuous_opportunity_score
 from core.ml.swing_data import build_swing_dataset
-from core.ml.swing_model import HORIZONS as SWING_HORIZONS, load_swing_model, scores_from_predictions
+from core.ml.swing_model import HORIZONS as SWING_HORIZONS, horizon_opportunity_score, load_swing_model, scores_from_predictions
 from core.config import SwingMLConfig
 from core.architecture import horizon_to_bars
 from train import load_config
@@ -191,7 +191,7 @@ def _infer_swing_forecast(
         expected_duration = float(outputs["duration"][0, list(SWING_HORIZONS).index(horizon_days)])
         entry_signal = float(outputs["entry"][0])
         expected_returns = {h: float(outputs["returns"][0, index]) for index, h in enumerate(SWING_HORIZONS)}
-        _, _, score = scores_from_predictions(expected_returns, expected_mfe, expected_mae, entry_signal, config)
+        score = horizon_opportunity_score(expected_return, expected_mfe, expected_mae, entry_signal, config)
         direction = "LONG" if expected_return > 0 else "SHORT" if expected_return < 0 else "UNCERTAIN"
         return ModelForecast("AVAILABLE", model_id, "swing-v1", asset, "SWING", timeframe, str(horizon), direction, score, expected_return, expected_mae, expected_mfe, "UNKNOWN", dataset.timestamps[-1].isoformat(), "Loaded registered SPY/QQQ swing checkpoint.", expected_duration=expected_duration, horizon=str(horizon), asset_class="equity", data_quality="AVAILABLE", confidence="UNKNOWN")
     except (OSError, ImportError, KeyError, TypeError, ValueError, RuntimeError) as exc:
@@ -225,6 +225,13 @@ def _infer_tcn_forecast(
 ) -> ModelForecast:
     """Infer the local checkpoint without invoking a foundation model."""
     model_id = "model1a_crypto_tcn" if "USDT" in asset else "model1b_equity_tcn"
+    if asset in {"SPY", "QQQ"} and category.upper() == "INTRADAY":
+        return ModelForecast(
+            "MODEL_UNAVAILABLE", model_id, "disabled-v3", asset, category, timeframe, str(horizon),
+            None, None, None, None, None, "UNKNOWN", None,
+            "Equity intraday TCN is disabled; use Chronos-2 with the rule-strategy agreement gate.",
+            horizon=str(horizon), asset_class="equity", data_quality="UNAVAILABLE",
+        )
     try:
         config = _config_for(asset, category, model_root)
         symbol = asset if "USDT" in asset else {"QQQ": "NASDAQ100_PROXY", "SPY": "SP500_PROXY"}.get(asset, asset)

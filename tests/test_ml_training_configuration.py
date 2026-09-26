@@ -27,14 +27,16 @@ def test_training_tcn_crypto_1h_yaml_loads_conservative_cuda_diagnostics() -> No
     assert config.inference_device == "cpu"
     assert config.ml.model_id == "tcn_crypto_1h"
     assert config.ml.batch_size == 2048
-    assert config.ml.learning_rate == 0.0003
+    assert config.ml.learning_rate == 0.0001
+    assert config.ml.max_epochs == 80
+    assert config.ml.early_stopping_patience == 6
     assert config.ml.use_amp is False
     assert config.ml.gradient_clip_norm == 1.0
     assert tuple(config.ml.forecast_horizons) == (1, 4, 8, 12, 24)
     assert config.ml.sequence_length == 128
     assert config.ml.hidden_channels == 96
     assert config.ml.num_layers == 6
-    assert config.ml.dropout == 0.35
+    assert config.ml.dropout == 0.45
 
 
 def test_training_crypto_intraday_yaml_uses_multi_horizon_contract() -> None:

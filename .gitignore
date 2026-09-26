@@ -10,14 +10,20 @@ env/
 # Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Runtime state, databases, and logs
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
 *.log
+*.err
 *.jsonl
 data/live_state.json
 data/trading_state.db
+data/trading_state.db-shm
+data/trading_state.db-wal
 
 # Local market/data caches (downloaded or generated during operation)
 data/market/
@@ -27,15 +33,12 @@ data/*.parquet
 # API Keys & local-only config
 /config.py
 
-# Generated reports and arbitrary JSON. Model metadata is explicitly allowed
-# below because it is required to reconstruct the committed checkpoints.
+# Generated reports and arbitrary JSON.
 *.json
+FINAL_*.md
+**/*oos_predictions*.csv
 
-# Model artifacts: current checkpoint total is ~14.45 MB, so Git LFS is not
-# required at present. Move these to Git LFS or a GitHub Release if they grow
-# beyond GitHub's regular-file limits.
-!data/models/**/*.pt
-!data/models/**/*.json
-!data/models/**/*.csv
-!models/**/*.pt
-!models/**/*.json
+# Trained model artifacts are local/generated and are not committed.
+/data/models/
+/models/checkpoints/
+*.pt

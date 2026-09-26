@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 
 from decision_engine import (
@@ -9,7 +10,8 @@ from decision_engine import (
     scenario_analysis,
 )
 import state_db
-from decision_pipeline import analyse_ohlcv, load_cached_ohlcv, model_quality
+from decision_pipeline import IndicatorSnapshot, ModelQuality, StrategyCandidate, analyse_ohlcv, build_integrated_plan, load_cached_ohlcv, model_quality
+from model_integration import ModelForecast, ModelComparison
 
 
 def _market() -> MarketSnapshot:
@@ -86,6 +88,49 @@ def test_missing_equity_cache_is_explicit() -> None:
     assert result.data_status == "INSUFFICIENT_DATA"
     assert result.plan is None
     assert result.model.status == "MODEL_NOT_AVAILABLE"
+
+
+def test_equity_intraday_plan_requires_chronos_trend_agreement() -> None:
+    index = pd.date_range("2025-01-01", periods=240, freq="1h", tz="UTC")
+    close = pd.Series(
+        100.0 + pd.Series(range(240), index=index) * 0.5 + pd.Series([i % 7 for i in range(240)], index=index) * 0.2,
+        index=index,
+        dtype=float,
+    )
+    frame = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 100.0})
+    chronos = ModelForecast(
+        "AVAILABLE", "chronos2", "v2", "QQQ", "INTRADAY", "1h", "4h", "SHORT", None,
+        None, None, None, "MEDIUM", index[-1].isoformat(), "test", horizon="4h",
+    )
+    comparison = ModelComparison(
+        ModelForecast("MODEL_UNAVAILABLE", "tcn", "disabled-v3", "QQQ", "INTRADAY", "1h", "4h", None, None, None, None, None, "UNKNOWN", None, "disabled"),
+        chronos, "RULE_REQUIRED", None, chronos,
+    )
+
+    result = analyse_ohlcv("QQQ", "1h", frame, model_comparison=comparison, asset_class="equity")
+
+    assert result.plan is None
+    assert result.best_candidate is None
+    assert "matching Chronos-2" in result.reason
+
+
+def test_integrated_plan_uses_fixed_atr_reward_multiples() -> None:
+    indicators = IndicatorSnapshot(
+        asset="BTC/USDT", timeframe="1h", timestamp="2026-01-01T00:00:00+00:00", close=100.0,
+        atr=2.0, atr_pct=0.02, ema_fast=110.0, ema_slow=105.0, trend_strength=2.5,
+        momentum_lookback=0.01, rsi=60.0, bollinger_middle=100.0, bollinger_upper=110.0,
+        bollinger_lower=90.0, donchian_upper=105.0, donchian_lower=95.0, volatility_pct=0.01,
+        regime="TREND_UP", data_status="FRESH",
+    )
+    candidate = StrategyCandidate("trend_breakout", "1.0.0", "TREND", "LONG", 80.0, True, ())
+    model = ModelQuality("MODEL_NOT_AVAILABLE", "none", "unknown", None, None, None, None, None, "")
+
+    plan = build_integrated_plan("BTC/USDT", "1h", indicators, candidate, model, capital=500.0)
+
+    assert plan is not None
+    assert plan.stop == pytest.approx(97.0)
+    assert plan.take_profit_1 == pytest.approx(104.5)
+    assert plan.take_profit_2 == pytest.approx(107.5)
 
 
 def test_model_score_requires_matching_artifact_and_keeps_scores_separate() -> None:

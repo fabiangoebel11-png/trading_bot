@@ -39,6 +39,8 @@ EQUITY_SWING_SCORE_THRESHOLD = 80.0
 EQUITY_ENTRY_SCORE_THRESHOLD = 80.0
 EXIT_SCORE_FLOOR = 40.0                # Regime-Dreher: Score faellt unter diese Schwelle -> Exit
 MAX_CONCURRENT_TRADES = 3              # Anlehnung an DataConfig-Hardcap (max 3 Symbole gleichzeitig)
+MAX_MARKET_STATE_AGE_SECONDS = 120.0
+MAX_SIGNAL_AGE_SECONDS = 20 * 60.0
 
 
 @dataclass
@@ -121,6 +123,33 @@ class PaperBroker:
         row = conn.execute("SELECT * FROM signals WHERE asset = ? AND model_type = ?", (asset, model_type)).fetchone()
         return dict(row) if row is not None else None
 
+    def _market_is_fresh(self, market: dict | None, now: datetime) -> bool:
+        if not market or not market.get("market_open"):
+            return False
+        if not market.get("feed_healthy") or not market.get("freshness_ok") or not market.get("warmup_ready"):
+            return False
+        data_age = market.get("data_age_seconds")
+        try:
+            data_age = float(data_age)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(data_age) or data_age < 0 or data_age > MAX_MARKET_STATE_AGE_SECONDS:
+            return False
+        return self._is_fresh_record(market, now, max_age_seconds=MAX_MARKET_STATE_AGE_SECONDS)
+
+    @staticmethod
+    def _is_fresh_record(record: dict | None, now: datetime, *, max_age_seconds: float) -> bool:
+        if not record or not record.get("updated_at"):
+            return False
+        try:
+            updated_at = datetime.fromisoformat(str(record["updated_at"]).replace("Z", "+00:00"))
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            age_seconds = (now - updated_at).total_seconds()
+        except (TypeError, ValueError):
+            return False
+        return 0.0 <= age_seconds <= max_age_seconds
+
     def _open_risk_eur(self, open_trades: list[dict]) -> float:
         """Summe des noch ausstehenden Verlust-Risikos aller offenen Trades
         (Notional * Stop-Distanz), fuer die geteilte 500-EUR-Wallet-Budgetierung."""
@@ -166,8 +195,8 @@ class PaperBroker:
     def _update_marks_and_exits(self, conn, open_trades: list[dict], now: datetime) -> None:
         for trade in open_trades:
             market = self._market_state(conn, trade["asset"])
-            if market is None or market["last_price"] is None:
-                continue  # kein frischer Preis diesen Zyklus -- Position bleibt unangetastet (z.B. Wochenende bei Equities)
+            if market is None or market["last_price"] is None or not self._market_is_fresh(market, now):
+                continue  # do not mark, trail, or exit from a stale/closed-session reference price
             price = float(market["last_price"])
             direction = trade["direction"]
             quantity = trade["quantity"]
@@ -198,7 +227,11 @@ class PaperBroker:
             # kurzfristiger Entry-Wackler).
             lead_model = "crypto_sniper" if trade["asset_class"] == "crypto" else "swing"
             signal = self._signal(conn, trade["asset"], lead_model)
-            if exit_reason is None and signal is not None:
+            if (
+                exit_reason is None
+                and signal is not None
+                and self._is_fresh_record(signal, now, max_age_seconds=MAX_SIGNAL_AGE_SECONDS)
+            ):
                 score = float(signal["swing_opportunity_score"] or signal["score"])
                 if score < EXIT_SCORE_FLOOR or (signal["direction"] in {"LONG", "SHORT"} and signal["direction"] != direction):
                     exit_reason = "regime_flip"
@@ -290,9 +323,12 @@ class PaperBroker:
             if asset in open_assets:
                 continue
             market = self._market_state(conn, asset)
-            if market is None or not market["market_open"] or market["last_price"] is None:
+            if market is None or market["last_price"] is None or not self._market_is_fresh(market, now):
                 continue
-            if not market["feed_healthy"] or not market["freshness_ok"] or not market["warmup_ready"]:
+            if not self._is_fresh_record(market, now, max_age_seconds=MAX_MARKET_STATE_AGE_SECONDS):
+                continue
+            data_age = market.get("data_age_seconds")
+            if data_age is None or not np.isfinite(float(data_age)) or float(data_age) > MAX_MARKET_STATE_AGE_SECONDS:
                 continue
 
             asset_class = market["asset_class"]
@@ -311,10 +347,16 @@ class PaperBroker:
             if len(open_trades) >= MAX_CONCURRENT_TRADES:
                 break
 
-    def _build_setup(self, conn, asset: str, asset_class: str, market: dict, portfolio: dict, open_risk_eur: float) -> TradeSetup | None:
+    def _build_setup(
+        self, conn, asset: str, asset_class: str, market: dict, portfolio: dict,
+        open_risk_eur: float, now: datetime | None = None,
+    ) -> TradeSetup | None:
+        now = now or datetime.now(timezone.utc)
         if asset_class == "crypto":
             signal = self._signal(conn, asset, "crypto_sniper")
             if signal is None or signal["score"] < CRYPTO_ENTRY_SCORE_THRESHOLD:
+                return None
+            if not self._is_fresh_record(signal, now, max_age_seconds=MAX_SIGNAL_AGE_SECONDS):
                 return None
             if signal["direction"] not in {"LONG", "SHORT"}:
                 return None
@@ -326,13 +368,17 @@ class PaperBroker:
         intraday = self._signal(conn, asset, "intraday")
         if swing is None or intraday is None:
             return None
+        if not self._is_fresh_record(swing, now, max_age_seconds=MAX_SIGNAL_AGE_SECONDS):
+            return None
+        if not self._is_fresh_record(intraday, now, max_age_seconds=MAX_SIGNAL_AGE_SECONDS):
+            return None
         swing_score = float(swing["swing_opportunity_score"] or swing["score"])
         entry_score = float(intraday["score"])
         if swing_score < EQUITY_SWING_SCORE_THRESHOLD or entry_score < EQUITY_ENTRY_SCORE_THRESHOLD:
             return None
-        if swing["direction"] not in {"LONG", "SHORT"}:
+        if swing["direction"] not in {"LONG", "SHORT"} or intraday["direction"] != swing["direction"]:
             return None
-        reason = f"swing={swing_score:.1f}>=80 & entry={entry_score:.1f}>=80"
+        reason = f"swing={swing_score:.1f}>=80 & Chronos+rule={entry_score:.1f}>=80, directions agree"
         return self._finalize_setup(asset, asset_class, swing["direction"], market, swing, portfolio, open_risk_eur, reason)
 
     def _finalize_setup(self, asset, asset_class, direction, market, lead_signal, portfolio, open_risk_eur, reason) -> TradeSetup:

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 
-from core.ml.data import load_ohlcv_parquet
-from core.ml.inference import load_symbol_model
 from core.ml.scoring import score_bucket_metrics, validate_model1_prediction_outputs
-from core.ml.train import _prepare_symbol_dataset, _to_sequences, evaluate_predictions, load_prepared_macro_matrix
-from core.ml.providers import AssetSpec, canonical_cache_path
+from core.ml.train import evaluate_predictions, load_prepared_macro_matrix
+from live_daemon import Model1Runner, _load_base_ohlc
 from train import load_config
 
 
@@ -42,26 +39,23 @@ def test_model1_nan_direction_is_unknown_and_public_validation_is_strict() -> No
         raise AssertionError("non-finite Model 1 output was accepted")
 
 
-def test_model1_real_cached_predictions_are_finite() -> None:
-    config = load_config("configs/training.yaml")
-    config.ml.model_dir = "data/models"
+def test_active_v3_crypto_predictions_are_finite() -> None:
+    config = load_config("configs/training_tcn_crypto_1h.yaml")
     macro = load_prepared_macro_matrix(config.ml)
-    breadth = pd.read_csv(
-        "data/ml_breadth_BNB-USDT_XRP-USDT_ADA-USDT_DOGE-USDT_LINK-USDT_5m_2500d.csv",
-        index_col=0,
-        parse_dates=True,
-    )["breadth_return"]
-    for symbol in ("NASDAQ100_PROXY", "SP500_PROXY"):
-        spec = AssetSpec(symbol, "QQQ" if symbol == "NASDAQ100_PROXY" else "SPY", "twelve_data", "5m", 1095)
-        ohlc = load_ohlcv_parquet(canonical_cache_path(config.ml.market_cache_dir, spec))
-        X, y, t1_pos, mfe, mae = _prepare_symbol_dataset(ohlc, macro, config.ml, breadth)
-        X_seq, y_seq, _, _, _, _ = _to_sequences(X, y, t1_pos, config.ml.sequence_length, mfe, mae)
-        model, _ = load_symbol_model(symbol, config.ml)
-        outputs = model.predict_trade_outputs(X_seq[-32:])
-        for value in outputs.values():
-            assert np.isfinite(value).all()
-        assert np.isfinite(outputs["opportunity"]).all()
-        assert np.isfinite(outputs["expected_return"]).all()
+    runner = Model1Runner(config.ml)
+    for symbol in config.ml.assets:
+        ohlc = _load_base_ohlc(config.ml, symbol)
+        assert ohlc is not None and not ohlc.empty
+        result = runner.infer_by_horizon(symbol, ohlc, macro, None)
+        assert result is not None
+        _, _, outputs_by_horizon = result
+        assert set(outputs_by_horizon) == {1, 4, 8, 12, 24}
+        for outputs in outputs_by_horizon.values():
+            for key in ("expected_return", "expected_mfe", "expected_mae", "expected_duration", "opportunity_score"):
+                assert np.isfinite(outputs[key])
+            probabilities = np.asarray(outputs["probabilities"], dtype=float)
+            assert np.isfinite(probabilities).all()
+            assert np.isclose(probabilities.sum(), 1.0, atol=0.01)
 
 
 def test_tcn_early_stopping_uses_patience_and_resets_after_improvement() -> None:

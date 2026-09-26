@@ -1,0 +1,135 @@
+universe_id: trading_bot_default_universe
+version: "1.0.0"
+assets:
+  - asset: BTC/USDT
+    asset_class: crypto
+    source: ccxt
+    provider_symbol: BTC/USDT
+    timeframes: [5m, 15m, 1h, 4h, 1d]
+    timezone: UTC
+    trading_hours: 24/7
+    roles: [TARGET, FEATURE]
+    expected_frequency: 5m
+    max_staleness_minutes: 15
+    quality_status: CACHE_REQUIRED
+  - asset: ETH/USDT
+    asset_class: crypto
+    source: ccxt
+    provider_symbol: ETH/USDT
+    timeframes: [5m, 15m, 1h, 4h, 1d]
+    timezone: UTC
+    trading_hours: 24/7
+    roles: [TARGET, FEATURE]
+    expected_frequency: 5m
+    max_staleness_minutes: 15
+    quality_status: CACHE_REQUIRED
+  - asset: SOL/USDT
+    asset_class: crypto
+    source: ccxt
+    provider_symbol: SOL/USDT
+    timeframes: [5m, 15m, 1h, 4h, 1d]
+    timezone: UTC
+    trading_hours: 24/7
+    roles: [TARGET, FEATURE]
+    expected_frequency: 5m
+    max_staleness_minutes: 15
+    quality_status: CACHE_REQUIRED
+  - asset: BNB/USDT
+    asset_class: crypto
+    source: ccxt
+    provider_symbol: BNB/USDT
+    timeframes: [1h, 4h, 1d]
+    timezone: UTC
+    trading_hours: 24/7
+    roles: [FEATURE]
+    expected_frequency: 1h
+    max_staleness_minutes: 120
+    quality_status: UNVERIFIED
+  - asset: SPY
+    asset_class: equity
+    source: yfinance
+    provider_symbol: SPY
+    timeframes: [5m, 1h, 1d]
+    timezone: America/New_York
+    trading_hours: NYSE_REGULAR
+    roles: [TARGET, FEATURE]
+    expected_frequency: 5m
+    max_staleness_minutes: 1440
+    quality_status: CACHE_REQUIRED
+  - asset: QQQ
+    asset_class: equity
+    source: yfinance
+    provider_symbol: QQQ
+    timeframes: [5m, 1h, 1d]
+    timezone: America/New_York
+    trading_hours: NASDAQ_REGULAR
+    roles: [TARGET, FEATURE]
+    expected_frequency: 5m
+    max_staleness_minutes: 1440
+    quality_status: CACHE_REQUIRED
+  - asset: DAX
+    asset_class: equity_index
+    source: yfinance
+    provider_symbol: ^GDAXI
+    timeframes: [1h, 1d]
+    timezone: Europe/Berlin
+    trading_hours: XETRA_REGULAR
+    roles: [FEATURE]
+    expected_frequency: 1d
+    max_staleness_minutes: 2880
+    quality_status: CACHE_REQUIRED
+  - asset: GOLD
+    asset_class: commodity
+    source: yfinance
+    provider_symbol: GC=F
+    timeframes: [1h, 1d]
+    timezone: UTC
+    trading_hours: EXCHANGE_SESSION
+    roles: [FEATURE]
+    expected_frequency: 1d
+    max_staleness_minutes: 2880
+    quality_status: CACHE_REQUIRED
+  - asset: VIX
+    asset_class: volatility_index
+    source: yfinance
+    provider_symbol: ^VIX
+    timeframes: [1d]
+    timezone: America/New_York
+    trading_hours: CBOE_REGULAR
+    roles: [FEATURE]
+    expected_frequency: 1d
+    max_staleness_minutes: 2880
+    quality_status: CACHE_REQUIRED
+  - asset: US10Y
+    asset_class: rate
+    source: yfinance
+    provider_symbol: ^TNX
+    timeframes: [1d]
+    timezone: America/New_York
+    trading_hours: MARKET_SESSION
+    roles: [FEATURE]
+    expected_frequency: 1d
+    max_staleness_minutes: 2880
+    quality_status: CACHE_REQUIRED
+  - asset: EURUSD
+    asset_class: fx
+    source: yfinance
+    provider_symbol: EURUSD=X
+    timeframes: [1h, 1d]
+    timezone: UTC
+    trading_hours: FX_WEEKDAY
+    roles: [FEATURE]
+    expected_frequency: 1d
+    max_staleness_minutes: 2880
+    quality_status: CACHE_REQUIRED
+  - asset: WTI
+    asset_class: commodity
+    source: yfinance
+    provider_symbol: CL=F
+    timeframes: [1h, 1d]
+    timezone: UTC
+    trading_hours: EXCHANGE_SESSION
+    roles: [FEATURE]
+    expected_frequency: 1d
+    max_staleness_minutes: 2880
+    quality_status: CACHE_REQUIRED

@@ -1,0 +1,28 @@
+data:
+  symbols: ["NASDAQ100_PROXY", "SP500_PROXY"]
+  market_type: "equity_index"
+  base_timeframe: "4h"
+ml:
+  enabled: false
+  model_id: "tcn_equity_4h"
+  model_role: "FORECAST"
+  production_timeframe: "4h"
+  base_timeframe: "4h"
+  context_required: true
+  context_feature_version: "context-v1"
+  assets: ["NASDAQ100_PROXY", "SP500_PROXY"]
+  optional_assets: []
+  model_dir: "data/models/tcn_equity_4h"
+  market_cache_dir: "data/market"
+  market_assets:
+    NASDAQ100_PROXY: {provider: "yfinance", provider_symbols: {yfinance: "QQQ"}, symbol: "QQQ", market_type: "equity_index", derive_from: "5m", session_timezone: "America/New_York"}
+    SP500_PROXY: {provider: "yfinance", provider_symbols: {yfinance: "SPY"}, symbol: "SPY", market_type: "equity_index", derive_from: "5m", session_timezone: "America/New_York"}
+  timeframes: ["4h", "1d"]
+  higher_timeframes: ["1d"]
+  macro_symbols: ["GC=F", "^VIX", "^TNX", "EURUSD=X", "CL=F", "^GDAXI", "ES=F", "NQ=F"]
+  macro_lookback_days: 2600
+  context_timeframes: ["1d"]
+  train_end: "2024-12-31 23:59:59"
+  validation_start: "2025-01-01 00:00:00"
+  validation_end: "2025-12-31 23:59:59"
+  test_start: "2026-01-01 00:00:00"

@@ -191,6 +191,16 @@ class MarketStateService:
             return _dax_state(asset, timestamp)
         return _crypto_state(asset, timestamp)
 
+    @staticmethod
+    def _equity_closed_session_is_current(market: MarketState, last_candle: datetime) -> bool:
+        if market.exchange_or_calendar != "NYSE/Nasdaq" or market.market_open:
+            return False
+        last_local = last_candle.astimezone(ZoneInfo("America/New_York")) if last_candle.tzinfo else last_candle.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York"))
+        if market.next_open is None:
+            return True
+        next_open_local = market.next_open.astimezone(ZoneInfo("America/New_York")) if market.next_open.tzinfo else market.next_open.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York"))
+        return last_local <= next_open_local
+
     def health(
         self,
         market: MarketState,
@@ -209,8 +219,12 @@ class MarketStateService:
         now = now or datetime.now(ZoneInfo("UTC"))
         last = last_candle.astimezone(ZoneInfo("UTC")) if last_candle.tzinfo else last_candle.replace(tzinfo=ZoneInfo("UTC"))
         age = max(0.0, (now - last).total_seconds())
-        fresh = age <= bar_seconds * 1.5
-        primary = FeedStatus.AVAILABLE if fresh else FeedStatus.STALE
+        if self._equity_closed_session_is_current(market, last):
+            fresh = True
+            primary = FeedStatus.AVAILABLE
+        else:
+            fresh = age <= bar_seconds * 1.5
+            primary = FeedStatus.AVAILABLE if fresh else FeedStatus.STALE
         healthy = fresh and feature_ready and warmup_ready
         return DataHealth(last, expected_candle_time, age, fresh, healthy, primary, context_available, context_freshness_ok, context_available and context_freshness_ok, feature_ready, warmup_ready, "" if healthy else "stale or incomplete prerequisites")
 

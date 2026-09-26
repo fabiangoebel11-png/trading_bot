@@ -1,0 +1,34 @@
+section,subject,asset,stage,usage,influence_on_eth,status,evidence,candidate,metric,value
+classification,final_category,ALL,summary,CLEAN_BUT_MULTI_ASSET_RESEARCH,NO_CROSS_ASSET_INFLUENCE,CONCLUDED,research/audit/asset_isolation_audit.md
+target_candidate,breakout_atr_60_1.0,ETH/USDT,phase2,"validation Sharpe 0.9493; WF median Sharpe 1.1168; OOS Sharpe 1.4412; stress median Sharpe 1.1296",NO_CROSS_ASSET_INFLUENCE,STORED,research/phase2_strategy_research.py:560,breakout_atr_60_1.0,validation_sharpe,0.9492516824253092
+phase2,raw_ohlcv,BTC/USDT,load,local frame only,NO,PARALLEL,research/phase2_strategy_research.py:77
+phase2,raw_ohlcv,ETH/USDT,load,local frame only,NO,TARGET,research/phase2_strategy_research.py:77
+phase2,raw_ohlcv,SOL/USDT,load,local frame only,NO,PARALLEL,research/phase2_strategy_research.py:77
+phase2,candidate_grid,BTC/USDT,search,58 fixed candidates,NO,PARALLEL,research/phase2_strategy_research.py:102
+phase2,candidate_grid,ETH/USDT,search,58 fixed candidates,NO,TARGET,research/phase2_strategy_research.py:102
+phase2,candidate_grid,SOL/USDT,search,58 fixed candidates,NO,PARALLEL,research/phase2_strategy_research.py:102
+phase2,parameter_stability,BTC/USDT,validation,same-symbol family peers,NO,ISOLATED,research/phase2_strategy_research.py:687
+phase2,parameter_stability,ETH/USDT,validation,same-symbol family peers,NO,ISOLATED,research/phase2_strategy_research.py:687
+phase2,parameter_stability,SOL/USDT,validation,same-symbol family peers,NO,ISOLATED,research/phase2_strategy_research.py:687
+phase2,robust_output,BTC/USDT,selection,no robust row in stored artifact,NO,PARALLEL,research/phase2_strategy_research.json:1
+phase2,robust_output,ETH/USDT,selection,six robust rows,NO,TARGET,research/phase2_strategy_research.json:1
+phase2,robust_output,SOL/USDT,selection,no robust row in stored artifact,NO,PARALLEL,research/phase2_strategy_research.json:1
+phase2,oos_gate,ETH/USDT,selection,OOS return Sharpe and drawdown enter robust gate,"NO BTC/SOL; YES TEMPORAL",CONTAMINATED,research/phase2_strategy_research.py:560
+partial_exit,base_candidate,BTC/USDT,management,fixed breakout_atr_60_1.0,NO,FIXED,research/partial_exit_research.py:40
+partial_exit,base_candidate,ETH/USDT,management,fixed breakout_atr_60_1.0,NO,FIXED,research/partial_exit_research.py:40
+partial_exit,base_candidate,SOL/USDT,management,fixed breakout_atr_60_1.0,NO,FIXED,research/partial_exit_research.py:40
+partial_exit,policy_evaluation,BTC/USDT,diagnosis,separate baseline and variants,NO,PARALLEL,research/partial_exit_research.py:293
+partial_exit,policy_evaluation,ETH/USDT,diagnosis,separate baseline and variants,NO,TARGET,research/partial_exit_research.py:293
+partial_exit,policy_evaluation,SOL/USDT,diagnosis,separate baseline and variants,NO,PARALLEL,research/partial_exit_research.py:293
+holdout,registered_scope,BTC/USDT,holdout,secondary test,NO,USED,research/partial_exit_holdout.py:420
+holdout,registered_scope,ETH/USDT,holdout,primary test,NO,TARGET,research/partial_exit_holdout.py:420
+holdout,registered_scope,SOL/USDT,holdout,secondary test,NO,USED,research/partial_exit_holdout.py:420
+holdout,integrity,ETH/USDT,holdout,same historical OOS read by prior diagnosis,NO CROSS-ASSET,NOT_PRISTINE,research/partial_exit_holdout.py:393
+ml,training,BTC/USDT,model,own per-symbol model,NO TARGET EVIDENCE,SEPARATE,core/ml/train.py:358
+ml,training,ETH/USDT,model,own per-symbol model with shared context,NO TARGET CANDIDATE EVIDENCE,SEPARATE,core/ml/train.py:358
+ml,training,SOL/USDT,model,separate saved artifact; not current configured asset set,NO,LEGACY_OR_SEPARATE,data/models/SOL-USDT_tcn_meta.json:1
+ml,breadth,BTC/ETH/SOL,features,traded symbols excluded from external basket,NO DIRECT SOL/BTC FEATURE,GUARDED,core/ml/features.py:256
+regime,phase2,BTC/ETH/SOL,regime,asset-local flags,NO,PER_ASSET,research/phase2_strategy_research.py:439
+leverage,phase2,BTC/ETH/SOL,sizing,one result at a time,NO,PER_ASSET,research/phase2_strategy_research.py:578
+leverage,production,BTC/ETH/SOL,portfolio,shared wallet weights and stop-out risk,YES PORTFOLIO ONLY,SEPARATE PATH,core/backtester.py:287
+selection,production,BTC/ETH/SOL,portfolio,optional top-N active symbol selection,YES PORTFOLIO ONLY,DISABLED BY DEFAULT,core/backtester.py:296

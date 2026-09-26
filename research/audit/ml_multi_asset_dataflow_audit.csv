@@ -1,0 +1,30 @@
+section,subject,asset_or_path,stage,usage,cross_asset_feature_scope,downstream_influence,status,evidence
+classification,final_category,ALL,summary,clean multi-asset context architecture with target-specific models,none as leakage,portfolio coupling only,CONCLUDED,research/audit/ml_multi_asset_dataflow_audit.md
+runtime,model1a,BTC/USDT,training,target-specific TCN,none,shared wallet only,CLEAN_TARGET_SPECIFIC,configs/training_crypto_intraday.yaml
+runtime,model1a,ETH/USDT,training,target-specific TCN,none,shared wallet only,CLEAN_TARGET_SPECIFIC,configs/training_crypto_intraday.yaml
+runtime,model1a,BTC/USDT,live_inference,own checkpoint and own OHLCV sequence,none,crypto_sniper signal,CURRENT,live_daemon.py
+runtime,model1a,ETH/USDT,live_inference,own checkpoint and own OHLCV sequence,none,crypto_sniper signal,CURRENT,live_daemon.py
+runtime,model1b,QQQ,training,proxy-specific TCN,six macro assets,matching-asset equity fusion,CLEAN_MULTI_ASSET_CONTEXT,configs/training_equity_intraday.yaml
+runtime,model1b,SPY,training,proxy-specific TCN,six macro assets,matching-asset equity fusion,CLEAN_MULTI_ASSET_CONTEXT,configs/training_equity_intraday.yaml
+runtime,model2,QQQ,training,separate swing checkpoint,six macro assets,matching-asset equity fusion,CLEAN_MULTI_ASSET_CONTEXT,models/checkpoints/qqq_swing.json
+runtime,model2,SPY,training,separate swing checkpoint,six macro assets,matching-asset equity fusion,CLEAN_MULTI_ASSET_CONTEXT,models/checkpoints/spy_swing.json
+feature_manifest,current_model1a,BTC/ETH,features,target-local technical plus 15m/1h/4h/1d HTF,none,no peer raw features,VERIFIED,data/models/model1a_crypto/*_tcn_meta.json
+feature_manifest,current_model1b,QQQ/SPY,features,target-local technical plus HTF, VIX/US10Y/EURUSD/GOLD/WTI/DAX,matching-asset scoring,VERIFIED,data/models/model1b_equity/*_tcn_meta.json
+feature_manifest,current_model2,QQQ/SPY,features,daily and intraday target-local branches,VIX/US10Y/EURUSD/GOLD/WTI/DAX,matching-asset scoring,VERIFIED,core/ml/swing_data.py
+feature_manifest,generic_training_yaml,QQQ/SPY/BTC/ETH,configuration,configured mixed universe,configured macro and optional breadth,research only,CONFIGURED_NOT_CURRENT_RUNTIME,configs/training.yaml
+feature_manifest,legacy_root_artifacts,mixed,artifact,older mixed-generation checkpoints,macro and/or breadth,not loaded by current root daemon,LEGACY_OR_SEPARATE,data/models/*_tcn_meta.json
+training,run_training_pipeline,each configured symbol,orchestration,one train_symbol_model call per symbol,shared prepared macro matrix may be reused,no pooled labels,VERIFIED,core/ml/train.py
+labels,triple_barrier,each target,labeling,future high/low used intentionally for labels only,none,not an input feature,CAUSAL_BY_SEPARATION,core/ml/labeling.py
+validation,chronological_purged_split,each target,split,configured train/validation/test boundaries and purge,none,validation only,IMPLEMENTED,core/ml/date_validation.py
+validation,purged_walk_forward_splits,current root trainer,split,imported but not invoked in inspected path,none,n_splits not verified active,PARTIAL_IMPLEMENTATION,core/ml/train.py
+regime,current_root_daemon,BTC/ETH,regime,score-driven Model 1A path,no cross-asset regime feature,crypto_sniper decision,CURRENT,live_daemon.py
+regime,legacy_ml_gate,per signal asset,regime,apply_regime_gated_ml_confirmation exists,asset-local close series,scales rule position only,SEPARATE_PATH,core/ml/inference.py
+strategy_selection,equity_fusion,QQQ/SPY,selection,Model 2 and Model 1B same-asset agreement,macro context already inside models,no cross-asset target selection,CLEAN_MULTI_ASSET_CONTEXT,core/signal_orchestrator.py
+execution,shared_wallet,BTC/ETH/QQQ/SPY,portfolio,open-risk sum and max concurrent trades,no feature input,changes allocation and trade admission,PORTFOLIO_COUPLING_ONLY,paper_broker.py
+artifact,BTC-USDT_tcn_meta,BTC/USDT,metadata,51-column target-local/HTF manifest,no macro/breadth columns,live Model 1A,CURRENT,data/models/model1a_crypto/BTC-USDT_tcn_meta.json
+artifact,ETH-USDT_tcn_meta,ETH/USDT,metadata,51-column target-local/HTF manifest,no macro/breadth columns,live Model 1A,CURRENT,data/models/model1a_crypto/ETH-USDT_tcn_meta.json
+artifact,NASDAQ100_PROXY_tcn_meta,QQQ,metadata,six macro families plus HTF,VIX/TNX/EURUSDX/GCF/CLF/GDAXI,live Model 1B,CURRENT,data/models/model1b_equity/NASDAQ100_PROXY_tcn_meta.json
+artifact,SP500_PROXY_tcn_meta,SPY,metadata,six macro families plus HTF,VIX/TNX/EURUSDX/GCF/CLF/GDAXI,live Model 1B,CURRENT,data/models/model1b_equity/SP500_PROXY_tcn_meta.json
+artifact,qqq_swing,QQQ,metadata,54 features,six macro symbols,live Model 2,CURRENT,models/checkpoints/qqq_swing.json
+artifact,spy_swing,SPY,metadata,54 features,six macro symbols,live Model 2,CURRENT,models/checkpoints/spy_swing.json
+artifact,SOL-USDT_tcn_meta,SOL/USDT,metadata,legacy five-fold artifact,legacy macro/breadth generation,not current root trio,LEGACY_OR_SEPARATE,data/models/SOL-USDT_tcn_meta.json

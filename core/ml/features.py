@@ -262,6 +262,15 @@ def _breadth_cache_path(data_config: DataConfig, config: TrendMLConfig) -> Path:
     return Path(data_config.cache_dir) / f"ml_breadth_{tag}_{config.base_timeframe}_{config.history_days}d.csv"
 
 
+def _breadth_freshness_limit_hours(config: TrendMLConfig) -> int:
+    """Keep the breadth cache usable only while it remains near the active
+    1h context window. A flat/stale signal older than about half the
+    configured rolling-correlation window is semantically unreliable for the
+    TCN and should be dropped rather than silently extended with forward-fill."""
+    corr_window = int(getattr(config, "breadth_corr_window", 60) or 60)
+    return max(12, corr_window // 2)
+
+
 def fetch_breadth_basket(data_config: DataConfig, config: TrendMLConfig, use_cache: bool = True) -> pd.Series:
     """Equal-weight log-return index of a basket of liquid crypto majors
     *outside* the traded BTC/ETH/SOL universe -- a proxy for systemic
@@ -274,9 +283,22 @@ def fetch_breadth_basket(data_config: DataConfig, config: TrendMLConfig, use_cac
         return pd.Series(dtype=float)
 
     cache_path = _breadth_cache_path(data_config, config)
+    breadth = pd.Series(dtype=float)
     if use_cache and cache_path.exists():
         print(f"⚡ Lade Breadth-Basket-Cache: {cache_path}")
-        return pd.read_csv(cache_path, index_col=0, parse_dates=True)["breadth_return"]
+        breadth = pd.read_csv(cache_path, index_col=0, parse_dates=True)["breadth_return"]
+        if not breadth.empty:
+            last_ts = pd.Timestamp(breadth.index[-1])
+            if last_ts.tzinfo is None:
+                last_ts = last_ts.tz_localize("UTC")
+            age_hours = (pd.Timestamp.now(tz="UTC") - last_ts).total_seconds() / 3600.0
+            freshness_limit_hours = _breadth_freshness_limit_hours(config)
+            if age_hours <= freshness_limit_hours:
+                return breadth
+            print(
+                f"⚠️ Breadth-Basket-Cache ist zu alt ({age_hours:.1f}h > {freshness_limit_hours}h); "
+                "semantisch unbrauchbar fuer breadth_corr; verwende Live-Fallback oder neutrale Imputation."
+            )
 
     closes = {}
     for symbol in config.breadth_symbols:
@@ -294,11 +316,14 @@ def fetch_breadth_basket(data_config: DataConfig, config: TrendMLConfig, use_cac
             closes[symbol] = history["close"]
 
     if not closes:
-        return pd.Series(dtype=float)
+        fallback_index = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=8, freq=config.base_timeframe)
+        neutral = pd.Series(0.0, index=fallback_index, name="breadth_return")
+        return neutral
 
     price_df = pd.DataFrame(closes).sort_index().ffill().dropna(how="all")
     log_returns = np.log(price_df / price_df.shift(1))
     breadth_return = log_returns.mean(axis=1).rename("breadth_return")  # equal-weight basket, not raw per-coin prices
+    breadth_return = breadth_return.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     if use_cache:
         os.makedirs(data_config.cache_dir, exist_ok=True)
@@ -315,7 +340,10 @@ def build_breadth_features(close: pd.Series, breadth_return: pd.Series, config: 
     the whole market is moving together/systemic, low when this coin is
     behaving idiosyncratically)."""
     if breadth_return.empty:
-        return pd.DataFrame(index=close.index)
+        fallback = pd.DataFrame(index=close.index)
+        for column in ("breadth_ret_1", "breadth_ret_6", "breadth_vol", "breadth_zscore", "breadth_corr"):
+            fallback[column] = 0.0
+        return fallback
 
     breadth = breadth_return.copy()
     breadth.index = pd.DatetimeIndex(pd.to_datetime(breadth.index, utc=True))
@@ -324,17 +352,27 @@ def build_breadth_features(close: pd.Series, breadth_return: pd.Series, config: 
     aligned.index = close_index
     out = pd.DataFrame(index=close.index)
     out["breadth_ret_1"] = aligned
-    out["breadth_ret_6"] = aligned.rolling(6).sum()
-    out["breadth_vol"] = aligned.rolling(config.breadth_vol_window).std()
+    out["breadth_ret_6"] = aligned.rolling(6).sum().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out["breadth_vol"] = aligned.rolling(config.breadth_vol_window).std().replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     roll_mean = aligned.rolling(config.breadth_zscore_window).mean()
     roll_std = aligned.rolling(config.breadth_zscore_window).std().replace(0, np.nan)
-    out["breadth_zscore"] = (aligned - roll_mean) / roll_std
+    out["breadth_zscore"] = ((aligned - roll_mean) / roll_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     symbol_close = close.copy()
     symbol_close.index = close_index
     symbol_log_ret = np.log(symbol_close / symbol_close.shift(1))
-    out["breadth_corr"] = symbol_log_ret.rolling(config.breadth_corr_window).corr(aligned)
+    corr = symbol_log_ret.rolling(config.breadth_corr_window).corr(aligned)
+    # pandas' rolling correlation can produce +/-inf when a window is degenerate
+    # (e.g. stale breadth forward-filled into a flat tail). Keep the problem
+    # local to the breadth correlation feature and convert invalid values to NaN
+    # so the existing warmup/data-quality logic can handle that row correctly
+    # without mutating the rest of the feature matrix.
+    corr = corr.replace([np.inf, -np.inf], np.nan)
+    breadth_var = aligned.rolling(config.breadth_corr_window).var(ddof=1)
+    symbol_var = symbol_log_ret.rolling(config.breadth_corr_window).var(ddof=1)
+    valid_mask = np.isfinite(corr.to_numpy()) & (breadth_var.to_numpy() > 0.0) & (symbol_var.to_numpy() > 0.0)
+    out["breadth_corr"] = corr.where(valid_mask, np.nan).fillna(0.0)
     return out
 
 
@@ -381,9 +419,10 @@ def build_feature_matrix(
         macro_daily = build_macro_features(macro_prices, config)
         macro_aligned = align_macro_to_intraday(macro_daily, ohlc.index, config.macro_reporting_lag_days)
         features = features.join(macro_aligned)
-    if breadth_return is not None and not breadth_return.empty:
+    if breadth_return is not None:
         breadth_features = build_breadth_features(ohlc["close"], breadth_return, config)
-        features = features.join(breadth_features)
+        if not breadth_features.empty:
+            features = features.join(breadth_features)
     for rule in config.higher_timeframes or []:
         htf_features = build_higher_timeframe_features(ohlc, rule, config)
         if htf_features.empty:

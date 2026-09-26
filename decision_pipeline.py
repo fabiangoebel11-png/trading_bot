@@ -350,9 +350,8 @@ def build_integrated_plan(asset: str, timeframe: str, indicators: IndicatorSnaps
     else:
         final_quality = float(np.clip(RULE_SCORE_WEIGHT * rule_score + MODEL_SCORE_WEIGHT * (model_score or 0.0) + RISK_SCORE_WEIGHT * risk_score, 0.0, 100.0))
     entry_offset = indicators.atr * 0.25
-    tp2_distance = risk.take_profit_distance_pct * 1.5
-    tp1 = indicators.close * (1 + tp2_distance * 0.5 if direction == "LONG" else 1 - tp2_distance * 0.5)
-    tp2 = indicators.close * (1 + tp2_distance if direction == "LONG" else 1 - tp2_distance)
+    tp1 = float(risk.take_profit_1_price)
+    tp2 = float(risk.take_profit_2_price)
     max_leverage = max_leverage_for(asset_class, instrument_type)
     conservative = max(1.0, risk.leverage * 0.75)
     aggressive = min(max_leverage, risk.leverage * 1.25)
@@ -375,6 +374,19 @@ def analyse_ohlcv(asset: str, timeframe: str, frame: pd.DataFrame | None, *, sig
         indicators = calculate_indicators(asset, timeframe, frame, data_status)
         candidates = select_strategy(indicators)
         best = next((candidate for candidate in candidates if candidate.valid), None)
+        decision_reason = "Rule-based strategy selection with optional validated model quality filter."
+        if asset in {"SPY", "QQQ"} and timeframe == "1h":
+            trend_candidate = next(
+                (candidate for candidate in candidates if candidate.strategy_id == "trend_breakout" and candidate.valid),
+                None,
+            )
+            chronos = getattr(model_comparison, "chronos", None)
+            if trend_candidate is None or getattr(chronos, "status", None) != "AVAILABLE" or getattr(chronos, "direction", None) != getattr(trend_candidate, "direction", None):
+                best = None
+                decision_reason = "No equity intraday recommendation: a valid trend-breakout rule and matching Chronos-2 direction are required."
+            else:
+                best = trend_candidate
+                decision_reason = "Equity intraday recommendation gated by matching trend-breakout and Chronos-2 directions."
         if forecast is not None and getattr(forecast, "status", "") == "AVAILABLE":
             signal = {
                 "model_type": getattr(forecast, "model_id", "model"),
@@ -389,7 +401,7 @@ def analyse_ohlcv(asset: str, timeframe: str, frame: pd.DataFrame | None, *, sig
         status = SetupStatus.VALID.value if plan else SetupStatus.NONE.value
         data_timestamp = indicators.timestamp
         age = max(0.0, (pd.Timestamp.now(tz="UTC") - pd.Timestamp(data_timestamp)).total_seconds())
-        return AnalysisResult(asset, timeframe, status, indicators.regime, indicators, candidates, best, model, plan, "Rule-based strategy selection with optional validated model quality filter.", pd.Timestamp.now(tz="UTC").isoformat(), data_timestamp, age, "local_cache", model_comparison, trade_quality)
+        return AnalysisResult(asset, timeframe, status, indicators.regime, indicators, candidates, best, model, plan, decision_reason, pd.Timestamp.now(tz="UTC").isoformat(), data_timestamp, age, "local_cache", model_comparison, trade_quality)
     except (ValueError, KeyError, TypeError) as exc:
         return AnalysisResult(asset, timeframe, SetupStatus.ERROR.value, MarketRegime.UNCLEAR.value, None, (), None, model_quality(signal, asset=asset, asset_class=asset_class), None, str(exc), pd.Timestamp.now(tz="UTC").isoformat(), model_comparison=model_comparison, trade_quality=trade_quality)
 

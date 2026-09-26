@@ -16,9 +16,10 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 # --- Instrument-specific leverage ceilings -----------------------------------
-# These are technical ceilings, never a target leverage.  A plain ETF price
-# series is an underlying, not a CFD, future, certificate, or margin product.
-# It therefore has no synthetic liquidation/KO level and is capped at 1x.
+# These are technical ceilings, never a target leverage. A plain ETF price
+# series is an underlying rather than a synthetic margin product, but the UI and
+# risk logic still accept a higher cash-equity leverage ceiling when the user
+# explicitly models a standard ETF position rather than a protected account.
 MAX_LEVERAGE_CRYPTO = 10.0
 MAX_LEVERAGE_EQUITY_UNDERLYING = 1.0
 
@@ -34,6 +35,8 @@ DEFAULT_MAX_POSITION_FRACTION = 0.35
 # das Modell eine sehr kleine erwartete MAE vorhersagt (Modell-Fehleinschätzung
 # nicht 1:1 vertrauen, ATR ist die "brutale" Marktrealität).
 DEFAULT_ATR_BUFFER_MULTIPLE = 1.5
+DEFAULT_TAKE_PROFIT_1_R_MULTIPLE = 1.5
+DEFAULT_TAKE_PROFIT_2_R_MULTIPLE = 2.5
 # Sicherheitsabstand zwischen Stop-Loss und Knock-Out-Barriere: die KO-Schwelle
 # liegt IMMER etwas jenseits des Stops, damit der Stop zuerst greift (ein KO
 # ist ein Total-/Fastverlust der Position, der Stop soll das verhindern).
@@ -54,6 +57,12 @@ class StrategyProfile:
     max_position_fraction: float
 
 
+RECOMMENDED_PROFILE = StrategyProfile(
+    name="recommended",
+    atr_buffer_multiple=1.75,
+    risk_per_trade_pct=0.018,
+    max_position_fraction=0.30,
+)
 AGGRESSIVE_PROFILE = StrategyProfile(
     name="aggressive",
     atr_buffer_multiple=1.0,
@@ -88,12 +97,14 @@ class TradeSetup:
     ko_safety_buffer_pct: float = DEFAULT_KO_SAFETY_BUFFER_PCT
     max_portfolio_risk_pct: float = 0.06   # Summe aller offenen Risiko-Budgets darf das nie überschreiten
     profile: str = "base"
+    selected_leverage: float | None = None
     # ``equity_underlying`` is the safe default for QQQ/SPY price data.  A
     # leveraged equity product must state its instrument and exchange ceiling
     # explicitly; asset class alone is not enough to infer leverage.
     instrument_type: str | None = None
     exchange_max_leverage: float | None = None
     available_margin_eur: float | None = None
+    usd_per_eur: float = 1.0
     margin_in_use_eur: float = 0.0
     confidence: float = 1.0
     volatility_multiplier: float = 1.0
@@ -113,6 +124,7 @@ class RiskParameters:
     take_profit_price: float
     knockout_barrier_price: float
     leverage: float
+    recommended_leverage: float
     position_size_eur: float     # Notional
     margin_eur: float            # tatsächlich gebundenes Kapital (Notional / Leverage)
     quantity: float               # Stück/Coins
@@ -120,6 +132,10 @@ class RiskParameters:
     risk_reward_ratio: float
     stop_distance_pct: float
     take_profit_distance_pct: float
+    take_profit_1_price: float | None = None
+    take_profit_2_price: float | None = None
+    trailing_stop_trigger_pct: float = 0.0
+    trailing_stop_price: float | None = None
     rejected: bool = False
     rejection_reason: str = ""
     profile: str = "base"
@@ -218,21 +234,31 @@ def select_effective_leverage(
 
 
 def compute_stop_distance_pct(entry_price: float, atr: float, expected_mae: float, atr_buffer_multiple: float) -> float:
-    """Stop-Distanz = max(|ML-MAE|, ATR-Puffer), niemals enger als beides."""
-    if entry_price <= 0:
+    """Calculate the stop distance from ATR only; ``expected_mae`` is legacy input."""
+    try:
+        entry_price = float(entry_price)
+        atr = float(atr)
+        atr_buffer_multiple = float(atr_buffer_multiple)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("entry price, ATR, and ATR multiple must be finite numbers") from exc
+    if not np.isfinite(entry_price) or entry_price <= 0:
         raise ValueError("entry_price must be positive")
-    atr_pct = abs(atr) / entry_price * atr_buffer_multiple if np.isfinite(atr) else 0.0
-    mae_pct = abs(expected_mae) if np.isfinite(expected_mae) else 0.0
-    return float(max(atr_pct, mae_pct, 1e-6))
+    if not np.isfinite(atr) or atr <= 0:
+        raise ValueError("ATR must be positive and finite")
+    if not np.isfinite(atr_buffer_multiple) or atr_buffer_multiple <= 0:
+        raise ValueError("ATR buffer multiple must be positive and finite")
+    return float((atr / entry_price) * atr_buffer_multiple)
 
 
 def compute_take_profit_distance_pct(expected_mfe: float, stop_distance_pct: float, min_reward_risk: float = 0.5) -> float:
-    """Take-Profit-Distanz direkt aus der ML-MFE-Schätzung, mit einer weichen
-    Untergrenze (min_reward_risk * stop_distance_pct) gegen ein wirtschaftlich
-    sinnlos enges Ziel -- die MFE-Schätzung selbst wird nie künstlich
-    aufgebläht, nur nach unten sauber begrenzt."""
-    mfe_pct = abs(expected_mfe) if np.isfinite(expected_mfe) else 0.0
-    return float(max(mfe_pct, min_reward_risk * stop_distance_pct))
+    """Return the fixed TP2 distance; model MFE and legacy RR input are ignored."""
+    try:
+        stop_distance_pct = float(stop_distance_pct)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stop distance must be a finite positive number") from exc
+    if not np.isfinite(stop_distance_pct) or stop_distance_pct <= 0:
+        raise ValueError("stop distance must be a finite positive number")
+    return float(stop_distance_pct * DEFAULT_TAKE_PROFIT_2_R_MULTIPLE)
 
 
 def fixed_fractional_position_fraction(capital_eur: float, open_risk_eur: float, risk_amount_eur: float, max_portfolio_risk_pct: float) -> float:
@@ -259,24 +285,70 @@ def kelly_fraction(win_rate: float, reward_risk_ratio: float, cap: float = 0.5) 
 
 
 def compute_knockout_barrier(entry_price: float, direction: str, leverage: float, stop_distance_pct: float, ko_safety_buffer_pct: float) -> float:
-    """KO-Barriere liegt hinter dem Stop-Loss (Sicherheitsabstand), aber
-    innerhalb dessen, was der Hebel selbst als Liquidations-/KO-Schwelle
-    implizieren würde -- der schärfere (näher am Einstieg liegende) der beiden
-    Werte gewinnt, damit die Barriere nie "hinter" dem theoretischen
-    Totalverlust-Punkt des Produkts liegt."""
-    if leverage <= 0:
-        raise ValueError("leverage must be positive")
+    """Place the KO barrier beyond the stop, rejecting leverage that cannot preserve that gap."""
+    values = (entry_price, leverage, stop_distance_pct, ko_safety_buffer_pct)
+    try:
+        entry_price, leverage, stop_distance_pct, ko_safety_buffer_pct = (float(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("knockout inputs must be finite numbers") from exc
+    if not all(np.isfinite(value) for value in (entry_price, leverage, stop_distance_pct, ko_safety_buffer_pct)):
+        raise ValueError("knockout inputs must be finite numbers")
+    if entry_price <= 0 or leverage < 1.0 or stop_distance_pct <= 0 or ko_safety_buffer_pct < 0:
+        raise ValueError("invalid entry, leverage, stop distance, or knockout buffer")
+    if direction not in {"LONG", "SHORT"}:
+        raise ValueError(f"Unknown direction {direction!r}")
     leverage_implied_pct = 1.0 / leverage
     ko_distance_pct = stop_distance_pct * (1.0 + ko_safety_buffer_pct)
-    # Never place the KO barrier beyond the product's own leverage-implied
-    # knock-out distance (that would be a fantasy price the issuer would
-    # never actually honor).
-    effective_pct = min(ko_distance_pct, leverage_implied_pct) if leverage_implied_pct > 0 else ko_distance_pct
+    if ko_distance_pct > leverage_implied_pct + 1e-12:
+        raise ValueError("selected leverage could liquidate before the stop-loss safety buffer")
     if direction == "LONG":
-        return float(entry_price * (1.0 - effective_pct))
-    if direction == "SHORT":
-        return float(entry_price * (1.0 + effective_pct))
-    raise ValueError(f"Unknown direction {direction!r}")
+        return float(entry_price * (1.0 - ko_distance_pct))
+    return float(entry_price * (1.0 + ko_distance_pct))
+
+
+def build_exit_plan(entry_price: float, direction: str, stop_distance_pct: float, take_profit_distance_pct: float, atr: float | None = None) -> dict[str, float]:
+    """Build directional fixed-R targets and a trailing trigger from ATR stop distance."""
+    try:
+        entry_price = float(entry_price)
+        stop_distance_pct = float(stop_distance_pct)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("entry price and stop distance must be finite numbers") from exc
+    if not np.isfinite(entry_price) or entry_price <= 0:
+        raise ValueError("entry_price must be positive")
+    if not np.isfinite(stop_distance_pct) or stop_distance_pct <= 0:
+        raise ValueError("stop distance must be positive and finite")
+    if direction not in {"LONG", "SHORT"}:
+        raise ValueError(f"Unknown direction {direction!r}")
+    tp1_pct = stop_distance_pct * DEFAULT_TAKE_PROFIT_1_R_MULTIPLE
+    tp2_pct = stop_distance_pct * DEFAULT_TAKE_PROFIT_2_R_MULTIPLE
+    trailing_trigger_pct = max(stop_distance_pct * 1.2, tp1_pct * 0.75)
+    if direction == "LONG":
+        stop_price = entry_price * (1.0 - stop_distance_pct)
+        tp1_price = entry_price * (1.0 + tp1_pct)
+        tp2_price = entry_price * (1.0 + tp2_pct)
+        trailing_stop_price = entry_price * (1.0 + trailing_trigger_pct)
+    else:
+        stop_price = entry_price * (1.0 + stop_distance_pct)
+        tp1_price = entry_price * (1.0 - tp1_pct)
+        tp2_price = entry_price * (1.0 - tp2_pct)
+        trailing_stop_price = entry_price * (1.0 - trailing_trigger_pct)
+    if min(stop_price, tp1_price, tp2_price, trailing_stop_price) <= 0:
+        raise ValueError("ATR stop distance produces a non-positive stop or target price")
+    if direction == "LONG":
+        ordered = stop_price < entry_price < tp1_price < tp2_price and trailing_stop_price > entry_price
+    else:
+        ordered = tp2_price < tp1_price < entry_price < stop_price and 0 < trailing_stop_price < entry_price
+    if not ordered:
+        raise ValueError("ATR stop distance collapses exit levels at price precision")
+    return {
+        "stop_distance_pct": float(stop_distance_pct),
+        "take_profit_1_pct": float(tp1_pct),
+        "take_profit_2_pct": float(tp2_pct),
+        "take_profit_1_price": float(tp1_price),
+        "take_profit_2_price": float(tp2_price),
+        "trailing_stop_trigger_pct": float(trailing_trigger_pct),
+        "trailing_stop_price": float(trailing_stop_price),
+    }
 
 
 def compute_risk_parameters(setup: TradeSetup) -> RiskParameters:
@@ -287,10 +359,20 @@ def compute_risk_parameters(setup: TradeSetup) -> RiskParameters:
     kaputte Order zu produzieren."""
     if setup.direction not in {"LONG", "SHORT"}:
         return _rejected(setup, f"invalid direction {setup.direction!r}")
+    try:
+        finite_inputs = all(np.isfinite(v) for v in (setup.entry_price, setup.atr, setup.score, setup.capital_eur))
+    except (TypeError, ValueError):
+        return _rejected(setup, "non-numeric risk input")
+    if not finite_inputs:
+        return _rejected(setup, "non-finite input")
     if setup.capital_eur <= 0 or setup.entry_price <= 0:
         return _rejected(setup, "non-positive capital or entry price")
-    if not all(np.isfinite(v) for v in (setup.entry_price, setup.atr, setup.expected_mae, setup.expected_mfe, setup.score, setup.capital_eur)):
-        return _rejected(setup, "non-finite input")
+    try:
+        usd_per_eur = float(setup.usd_per_eur)
+    except (TypeError, ValueError):
+        return _rejected(setup, "USD per EUR exchange rate must be finite and positive")
+    if not np.isfinite(usd_per_eur) or usd_per_eur <= 0:
+        return _rejected(setup, "USD per EUR exchange rate must be finite and positive")
 
     try:
         instrument_type = instrument_type_for(setup.asset_class, setup.instrument_type)
@@ -298,8 +380,69 @@ def compute_risk_parameters(setup: TradeSetup) -> RiskParameters:
     except ValueError as exc:
         return _rejected(setup, str(exc))
 
-    stop_distance_pct = compute_stop_distance_pct(setup.entry_price, setup.atr, setup.expected_mae, setup.atr_buffer_multiple)
-    take_profit_distance_pct = compute_take_profit_distance_pct(setup.expected_mfe, stop_distance_pct)
+    if setup.selected_leverage is not None:
+        if not np.isfinite(setup.selected_leverage):
+            return _rejected(setup, "selected leverage must be finite")
+        if setup.selected_leverage <= 0:
+            return _rejected(setup, "selected leverage must be greater than 0x")
+        if setup.selected_leverage < 1.0:
+            return _rejected(setup, "selected leverage must be at least 1.0x")
+    if not np.isfinite(setup.ko_safety_buffer_pct) or setup.ko_safety_buffer_pct < 0:
+        return _rejected(setup, "knockout safety buffer must be finite and non-negative")
+    try:
+        sizing_inputs = (
+            float(setup.open_risk_eur),
+            float(setup.margin_in_use_eur),
+            float(setup.max_position_fraction),
+            float(setup.max_portfolio_risk_pct),
+        )
+    except (TypeError, ValueError):
+        return _rejected(setup, "non-numeric portfolio sizing input")
+    if not all(np.isfinite(value) for value in sizing_inputs):
+        return _rejected(setup, "non-finite portfolio sizing input")
+    open_risk_eur, margin_in_use_eur, max_position_fraction, max_portfolio_risk_pct = sizing_inputs
+    if open_risk_eur < 0 or margin_in_use_eur < 0:
+        return _rejected(setup, "open risk and margin in use must be non-negative")
+    if not 0 < max_position_fraction <= 1.0:
+        return _rejected(setup, "max position fraction must be in (0, 1]")
+    if not 0 < max_portfolio_risk_pct <= 1.0:
+        return _rejected(setup, "max portfolio risk fraction must be in (0, 1]")
+    if setup.available_margin_eur is None:
+        available_margin_eur = setup.capital_eur - margin_in_use_eur
+    else:
+        try:
+            available_margin_eur = float(setup.available_margin_eur)
+        except (TypeError, ValueError):
+            return _rejected(setup, "available margin must be finite and non-negative")
+    if not np.isfinite(available_margin_eur) or available_margin_eur < 0:
+        return _rejected(setup, "available margin must be finite and non-negative")
+    capital_usd = setup.capital_eur * usd_per_eur
+    open_risk_usd = open_risk_eur * usd_per_eur
+    margin_in_use_usd = margin_in_use_eur * usd_per_eur
+    available_margin_usd = available_margin_eur * usd_per_eur
+    if not np.isfinite([capital_usd, open_risk_usd, margin_in_use_usd, available_margin_usd]).all():
+        return _rejected(setup, "converted USD sizing inputs must be finite")
+
+    try:
+        stop_distance_pct = compute_stop_distance_pct(setup.entry_price, setup.atr, setup.expected_mae, setup.atr_buffer_multiple)
+        take_profit_distance_pct = compute_take_profit_distance_pct(setup.expected_mfe, stop_distance_pct)
+        exit_plan = build_exit_plan(setup.entry_price, setup.direction, stop_distance_pct, take_profit_distance_pct, setup.atr)
+    except (TypeError, ValueError) as exc:
+        return _rejected(setup, str(exc))
+
+    has_exchange_liquidation = instrument_type in {"crypto_perpetual", "crypto_future", "equity_cfd", "equity_future", "equity_margin"}
+    max_allowed_leverage = max_leverage
+    if has_exchange_liquidation:
+        safe_leverage = 1.0 / (stop_distance_pct * (1.0 + setup.ko_safety_buffer_pct))
+        max_allowed_leverage = min(max_leverage, safe_leverage)
+        if max_allowed_leverage < 1.0:
+            return _rejected(setup, "ATR stop and safety buffer cannot be protected at minimum leverage")
+    if setup.selected_leverage is not None and setup.selected_leverage > max_allowed_leverage + 1e-12:
+        return _rejected(
+            setup,
+            f"selected leverage {setup.selected_leverage:.2f}x exceeds stop-safe max {max_allowed_leverage:.2f}x",
+        )
+
     risk_reward_ratio = take_profit_distance_pct / stop_distance_pct if stop_distance_pct > 0 else 0.0
 
     allowed_fraction = allowed_risk_fraction(
@@ -311,33 +454,33 @@ def compute_risk_parameters(setup: TradeSetup) -> RiskParameters:
         volatility_multiplier=setup.volatility_multiplier,
         correlation_multiplier=setup.correlation_multiplier,
     )
-    raw_risk_amount_eur = setup.capital_eur * allowed_fraction
-    risk_amount_eur = fixed_fractional_position_fraction(setup.capital_eur, setup.open_risk_eur, raw_risk_amount_eur, setup.max_portfolio_risk_pct)
-    if risk_amount_eur <= 0:
+    raw_risk_amount_usd = capital_usd * allowed_fraction
+    risk_amount_usd = fixed_fractional_position_fraction(capital_usd, open_risk_usd, raw_risk_amount_usd, max_portfolio_risk_pct)
+    if risk_amount_usd <= 0:
         return _rejected(setup, "portfolio risk budget exhausted by already-open trades")
 
-    risk_based_notional = risk_amount_eur / stop_distance_pct
-    available_margin_eur = setup.available_margin_eur if hasattr(setup, "available_margin_eur") else None
-    if available_margin_eur is None:
-        available_margin_eur = setup.capital_eur - max(setup.margin_in_use_eur, 0.0)
-    max_margin_eur = max(min(float(available_margin_eur), setup.capital_eur) * setup.max_position_fraction, 0.0)
-    max_notional_eur = max_margin_eur * max_leverage
+    risk_based_notional_usd = risk_amount_usd / stop_distance_pct
+    max_margin_usd = min(available_margin_usd, capital_usd) * max_position_fraction
+    max_notional_usd = max_margin_usd * max_allowed_leverage
     if setup.max_notional_eur is not None:
         if not np.isfinite(setup.max_notional_eur) or setup.max_notional_eur <= 0:
             return _rejected(setup, "invalid max_notional_eur")
-        max_notional_eur = min(max_notional_eur, setup.max_notional_eur)
-    position_size_eur = float(min(risk_based_notional, max_notional_eur))
-    leverage = select_effective_leverage(position_size_eur, max_margin_eur, max_leverage)
-    if leverage <= 0:
+        max_notional_usd = min(max_notional_usd, setup.max_notional_eur * usd_per_eur)
+    position_size_usd = float(min(risk_based_notional_usd, max_notional_usd))
+    recommended_leverage = select_effective_leverage(position_size_usd, max_margin_usd, max_allowed_leverage)
+    if recommended_leverage <= 0:
         return _rejected(setup, "no available margin for risk-based notional")
-    # Required margin is derived only after the final notional and leverage.
-    margin_eur = max(position_size_eur / leverage, 1e-9)
-    risk_amount_eur = position_size_eur * stop_distance_pct
+    leverage = float(setup.selected_leverage) if setup.selected_leverage is not None else recommended_leverage
+    if leverage > max_allowed_leverage:
+        return _rejected(setup, f"selected leverage {leverage:.2f}x exceeds stop-safe max {max_allowed_leverage:.2f}x")
+    margin_usd = max(position_size_usd / leverage, 1e-9)
+    if margin_usd > max_margin_usd + max(1e-8, max_margin_usd * 1e-9):
+        return _rejected(setup, "selected leverage requires more than the available margin budget")
+    risk_amount_usd = position_size_usd * stop_distance_pct
 
-    quantity = position_size_eur / setup.entry_price
+    quantity = position_size_usd / setup.entry_price
     stop_loss_price = setup.entry_price * (1.0 - stop_distance_pct) if setup.direction == "LONG" else setup.entry_price * (1.0 + stop_distance_pct)
     take_profit_price = setup.entry_price * (1.0 + take_profit_distance_pct) if setup.direction == "LONG" else setup.entry_price * (1.0 - take_profit_distance_pct)
-    has_exchange_liquidation = instrument_type in {"crypto_perpetual", "crypto_future", "equity_cfd", "equity_future", "equity_margin"}
     knockout_barrier_price = compute_knockout_barrier(setup.entry_price, setup.direction, leverage, stop_distance_pct, setup.ko_safety_buffer_pct) if has_exchange_liquidation else 0.0
     liquidation_distance_pct = 1.0 / leverage if has_exchange_liquidation else None
     liquidation_price = None
@@ -356,18 +499,23 @@ def compute_risk_parameters(setup: TradeSetup) -> RiskParameters:
         take_profit_price=take_profit_price,
         knockout_barrier_price=knockout_barrier_price,
         leverage=leverage,
-        position_size_eur=position_size_eur,
-        margin_eur=margin_eur,
+        recommended_leverage=recommended_leverage,
+        position_size_eur=position_size_usd / usd_per_eur,
+        margin_eur=margin_usd / usd_per_eur,
         quantity=quantity,
-        risk_amount_eur=risk_amount_eur,
+        risk_amount_eur=risk_amount_usd / usd_per_eur,
         risk_reward_ratio=risk_reward_ratio,
         stop_distance_pct=stop_distance_pct,
         take_profit_distance_pct=take_profit_distance_pct,
+        take_profit_1_price=exit_plan["take_profit_1_price"],
+        take_profit_2_price=exit_plan["take_profit_2_price"],
+        trailing_stop_trigger_pct=exit_plan["trailing_stop_trigger_pct"],
+        trailing_stop_price=exit_plan["trailing_stop_price"],
         profile=getattr(setup, "profile", "base"),
         trade_quality=float(np.clip(setup.score / 100.0, 0.0, 1.0) * np.clip(setup.confidence, 0.0, 1.0)),
         allowed_risk_fraction=allowed_fraction,
-        risk_based_notional_eur=risk_based_notional,
-        max_allowed_leverage=max_leverage,
+        risk_based_notional_eur=risk_based_notional_usd / usd_per_eur,
+        max_allowed_leverage=max_allowed_leverage,
         instrument_type=instrument_type,
         protection_model="exchange_liquidation_estimate" if has_exchange_liquidation else "underlying_no_liquidation",
         liquidation_price=liquidation_price,
@@ -379,7 +527,7 @@ def _rejected(setup: TradeSetup, reason: str) -> RiskParameters:
     return RiskParameters(
         asset=setup.asset, direction=setup.direction, entry_price=setup.entry_price,
         stop_loss_price=0.0, take_profit_price=0.0, knockout_barrier_price=0.0,
-        leverage=0.0, position_size_eur=0.0, margin_eur=0.0, quantity=0.0,
+        leverage=0.0, recommended_leverage=0.0, position_size_eur=0.0, margin_eur=0.0, quantity=0.0,
         risk_amount_eur=0.0, risk_reward_ratio=0.0, stop_distance_pct=0.0,
         take_profit_distance_pct=0.0, rejected=True, rejection_reason=reason,
         profile=getattr(setup, "profile", "base"),
@@ -409,8 +557,16 @@ def compute_profile_parameters(setup: TradeSetup, profile: StrategyProfile) -> R
 
 
 def compute_strategy_profiles(setup: TradeSetup) -> dict[str, RiskParameters]:
-    """Return both profiles on every cycle, regardless of signal quality."""
+    """Return all usable risk profiles, including the mathematically preferred recommendation."""
+    profiles = {
+        RECOMMENDED_PROFILE.name: compute_profile_parameters(setup, RECOMMENDED_PROFILE),
+        AGGRESSIVE_PROFILE.name: compute_profile_parameters(setup, AGGRESSIVE_PROFILE),
+        CONSERVATIVE_PROFILE.name: compute_profile_parameters(setup, CONSERVATIVE_PROFILE),
+    }
+    if not profiles[RECOMMENDED_PROFILE.name].rejected:
+        return profiles
     return {
+        RECOMMENDED_PROFILE.name: compute_risk_parameters(setup),
         AGGRESSIVE_PROFILE.name: compute_profile_parameters(setup, AGGRESSIVE_PROFILE),
         CONSERVATIVE_PROFILE.name: compute_profile_parameters(setup, CONSERVATIVE_PROFILE),
     }

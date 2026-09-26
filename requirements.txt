@@ -1,0 +1,7 @@
+--index-url https://download.pytorch.org/whl/cu124
+
+# CUDA-enabled PyTorch stack for Windows/Python 3.12 RTX 3070 setup
+# This is the required runtime for this project and must not silently fall back to CPU-only builds.
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124

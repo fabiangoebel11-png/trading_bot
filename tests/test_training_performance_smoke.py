@@ -3,11 +3,36 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 
 from core.ml.tcn_model import TCNTrendModel
-from core.ml.train import _prepare_symbol_dataset, _to_sequences, load_ml_ohlc
+from core.ml.train import _prepare_symbol_dataset, _to_sequences, enforce_live_safe_feature_set, live_safe_feature_columns, load_ml_ohlc
 from train import load_config
+
+
+def test_training_feature_contract_excludes_external_context() -> None:
+    cfg = load_config("configs/training_crypto_intraday.yaml")
+    columns = live_safe_feature_columns(cfg.ml)
+    features = pd.DataFrame(1.0, index=range(2), columns=[*columns, "VIX_ret", "breadth_corr"])
+
+    selected = enforce_live_safe_feature_set(features, cfg.ml)
+
+    assert tuple(selected.columns) == columns
+    assert "VIX_ret" not in selected.columns
+    assert "breadth_corr" not in selected.columns
+
+
+def test_training_feature_contract_rejects_arbitrary_configured_columns() -> None:
+    cfg = load_config("configs/training_crypto_intraday.yaml")
+    cfg.ml.feature_columns = ["log_ret_1"]
+
+    try:
+        live_safe_feature_columns(cfg.ml)
+    except ValueError as exc:
+        assert "exactly match" in str(exc)
+    else:
+        raise AssertionError("arbitrary feature_columns must be rejected")
 
 
 def test_training_benchmark_smoke_stays_within_safe_vram_and_completes() -> None:

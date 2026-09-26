@@ -1,0 +1,19 @@
+data:
+  symbols: ["BTC/USDT"]
+  market_type: "swap"
+  base_timeframe: "1h"
+trade_quality:
+  enabled: false
+  production_enabled: false
+  model_id: "trade_quality_hgb"
+  model_version: "hgb-trade-quality-v1"
+  timeframe: "1h"
+  horizon_bars: 24
+  stop_atr_multiple: 3.0
+  take_profit_atr_multiple: 6.0
+  fee_rate: 0.00035
+  slippage_rate: 0.00020
+  min_probability: 0.60
+  feature_version: "trade-entry-v1"
+  label_version: "directional-triple-barrier-v1"
+  model_dir: "data/models/trade_quality"

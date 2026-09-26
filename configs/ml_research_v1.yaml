@@ -1,0 +1,125 @@
+research_version: "3.3.0"
+data_universe_version: "trading_bot_default_universe-1.1.0"
+dataset_version: "crypto_target_causal_v1"
+feature_set_version: "crypto_core_v1"
+proxy_feature_set_version: "crypto_context_proxy_v1"
+label_set_version: "labels_v1"
+split_version: "walk_forward_2025_holdout_v1"
+model_set_version: "baseline_and_tcn_candidates_v1"
+random_seed: 42
+
+target_assets:
+  - BTC/USDT
+  - ETH/USDT
+context_assets:
+  - ES_F_PROXY
+  - NQ_F_PROXY
+  - VIX
+  - URTH
+context_policy: "context assets are never prediction targets"
+
+proxy_data:
+  source_file: data/ml_macro_ESF_NQF_VIX_URTH_2600d.csv
+  source_frequency: daily
+  timestamps: date_only_utc_normalized
+  availability_lag: 2d
+  max_staleness: 5d
+  status: AVAILABLE_PROXY
+  promoted: false
+
+observation_timeframes: [1h, 4h]
+horizons:
+  1h: [1h, 2h, 4h, 8h, 12h, 24h, 3d, 7d]
+  4h: [7d, 14d, 21d, 28d]
+
+labels:
+  primary:
+    name: direction_raw_v1
+    formula: "future_return = close[t+h]/close[t] - 1; direction = 1 if future_return > 0 else 0"
+    threshold: 0.0
+    fees_in_label: false
+  secondary:
+    name: direction_cost_aware_v1
+    formula: "direction = 1 if future_return > fixed_cost_threshold else 0"
+    threshold_bps: 20
+    fees_assumption: "fixed 20 bps round-trip research threshold; not optimized"
+    fees_in_label: true
+  regression:
+    - future_return
+    - future_log_return
+  future_outcomes:
+    - mae
+    - mfe
+    - stop_hit_probability
+    - holding_time
+  outcome_policy: "future outcomes are labels only and never input features"
+
+feature_sets:
+  crypto_core_v1:
+    status: FROZEN_DEFAULT
+    groups: [returns, momentum, rsi, sma_ema, volatility, range, volume, breakout_structure]
+    proxies_included: false
+  crypto_context_proxy_v1:
+    status: OPTIONAL_NOT_PROMOTED
+    groups: [ES_F_PROXY, NQ_F_PROXY, VIX, URTH]
+    proxies_included: true
+
+leakage_contract:
+  availability_rule: "availability_timestamp <= prediction_timestamp"
+  alignment: backward_asof
+  forward_fill: forbidden_unless_feature_contract_allows
+  backward_fill: forbidden
+  interpolation: forbidden
+  scaling: train_only
+  closed_candle_required: true
+  proxy_staleness_enforced: true
+
+splits:
+  train_history_start: "2017-08-17T00:00:00Z"
+  folds:
+    - id: wf_2022
+      train_start: "2017-08-17T00:00:00Z"
+      train_end: "2021-12-31T23:59:59Z"
+      validation_start: "2022-01-01T00:00:00Z"
+      validation_end: "2022-12-31T23:59:59Z"
+    - id: wf_2023
+      train_start: "2017-08-17T00:00:00Z"
+      train_end: "2022-12-31T23:59:59Z"
+      validation_start: "2023-01-01T00:00:00Z"
+      validation_end: "2023-12-31T23:59:59Z"
+    - id: wf_2024
+      train_start: "2017-08-17T00:00:00Z"
+      train_end: "2023-12-31T23:59:59Z"
+      validation_start: "2024-01-01T00:00:00Z"
+      validation_end: "2024-12-31T23:59:59Z"
+  final_holdout:
+    start: "2025-01-01T00:00:00Z"
+    end: "2026-09-22T23:59:59Z"
+    policy: "evaluate once after validation/model/feature freeze; never select"
+  purge_rule: "remove any training sample whose label_end >= validation_or_holdout_start"
+  embargo_rule: "remove one complete target horizon immediately before each evaluation start"
+
+models:
+  baseline:
+    - LogisticRegression
+    - HistGradientBoostingClassifier
+    - RandomForestClassifier
+  excluded:
+    - name: XGBoost
+      reason: dependency_not_installed
+    - name: LightGBM
+      reason: dependency_not_installed
+  deep_learning:
+    - name: project_owned_TCNTrendModel
+      status: CANDIDATE_ONLY
+      condition: "must consume this dataset, split, and leakage contract before training"
+
+evaluation_metrics:
+  classification: [roc_auc, pr_auc, balanced_accuracy, log_loss, brier_score, calibration]
+  regression: [mae, rmse, rank_correlation, directional_accuracy]
+  diagnostic_only: [mean_return_conditional_on_signal, return_distribution, signal_frequency, turnover_proxy, signal_only_sharpe]
+holdout_policy:
+  selection_allowed: false
+  training_allowed: false
+  reporting_allowed: true
+  strategy_promotion_allowed: false

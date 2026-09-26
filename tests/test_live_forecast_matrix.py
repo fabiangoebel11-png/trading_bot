@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,7 +8,7 @@ import pandas as pd
 
 import live_daemon
 import state_db
-from core.ml.assistant_forecasts import PUBLIC_HORIZONS, direct_swing_forecasts, direct_tcn_forecasts
+from core.ml.assistant_forecasts import AssistantForecast, PUBLIC_HORIZONS, combine_model_forecasts, direct_swing_forecasts, direct_tcn_forecasts
 
 
 def _tcn_output() -> dict:
@@ -16,6 +17,63 @@ def _tcn_output() -> dict:
         "expected_mae": -0.01, "expected_duration": 4.0, "opportunity_score": 65.0,
         "direction": "LONG",
     }
+
+
+def _chronos_forecast(score: float) -> AssistantForecast:
+    now = datetime.now(timezone.utc).isoformat()
+    return AssistantForecast(
+        asset="BTC/USDT", asset_class="crypto", timeframe="1h", horizon="4h",
+        forecast_source="CHRONOS_2", model="chronos2", model_version="v1", direction="LONG",
+        probability_short=None, probability_neutral=None, probability_long=None,
+        expected_return=0.01, expected_mfe=None, expected_mae=None, expected_duration=None,
+        opportunity_score=score, confidence="MEDIUM", forecast_timestamp=now, target_timestamp=None,
+        data_quality="AVAILABLE", forecast_status="PARTIALLY_VALIDATED", quality_status="PARTIALLY_VALIDATED",
+        usable_for_decision=False, freshness="FRESH", forecast_age_minutes=0.0,
+        p10_price=99.0, p50_price=101.0, p90_price=103.0,
+    )
+
+
+def test_only_strong_two_model_agreement_creates_crypto_paper_signal() -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    tcn = direct_tcn_forecasts(
+        asset="BTC/USDT", asset_class="crypto", model="tcn_crypto_1h", model_version="v1",
+        timestamp=timestamp, outputs={4: _tcn_output()},
+    )[1]
+    weak = live_daemon._require_chronos_directional_edge(
+        combine_model_forecasts([tcn, _chronos_forecast(50.5)])
+    )
+    strong = live_daemon._require_chronos_directional_edge(
+        combine_model_forecasts([tcn, _chronos_forecast(live_daemon.MIN_CHRONOS_SIGNAL_SCORE)])
+    )
+
+    assert weak.forecast_status == "DEGRADED"
+    assert not weak.usable_for_decision
+    assert live_daemon._crypto_signal_from_consensus([weak], datetime.now(timezone.utc))["direction"] == "UNCERTAIN"
+    assert strong.forecast_status == "MODEL_AGREEMENT"
+    assert strong.usable_for_decision
+    signal = live_daemon._crypto_signal_from_consensus([strong], datetime.now(timezone.utc))
+    assert signal["direction"] == "LONG"
+    assert signal["score"] >= live_daemon.MIN_CHRONOS_SIGNAL_SCORE
+
+
+def test_equity_intraday_signal_uses_both_consensus_components() -> None:
+    now = datetime.now(timezone.utc)
+    forecast = SimpleNamespace(
+        horizon="4h", forecast_status="MODEL_AGREEMENT", usable_for_decision=True,
+        direction="LONG", forecast_timestamp=now.isoformat(), expected_return=0.02,
+        expected_duration=None, expected_mfe=None, expected_mae=None, model_version="chronos-v1",
+        individual_forecasts=(
+            {"model": "RULE_STRATEGY", "direction": "LONG", "score": 88.0},
+            {"model": "chronos2", "direction": "LONG", "opportunity_score": 72.0},
+        ),
+    )
+
+    signal = live_daemon._equity_intraday_signal_from_consensus([forecast], now)
+
+    assert signal["direction"] == "LONG"
+    assert signal["score"] == 72.0
+    assert signal["rule_score"] == 88.0
+    assert signal["expected_duration"] == 4.0
 
 
 def test_complete_four_asset_matrix_persists_all_public_horizons(tmp_path) -> None:

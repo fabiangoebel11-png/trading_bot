@@ -64,6 +64,16 @@ def test_feed_health_missing_and_stale_statuses() -> None:
     assert stale.primary_status == FeedStatus.STALE
 
 
+def test_us_equity_daily_bar_is_fresh_overnight_and_weekend() -> None:
+    service = MarketStateService()
+    weekend_now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+    market = service.state_at("QQQ", weekend_now)
+    last = datetime(2026, 9, 25, 16, 0, tzinfo=timezone.utc)
+    health = service.health(market, last_candle=last, expected_candle_time=last, now=weekend_now, bar_seconds=86400)
+    assert health.freshness_ok is True
+    assert health.feed_healthy is True
+
+
 def test_prediction_duration_is_decoupled_from_leverage() -> None:
     prediction = _prediction(87)
     assert prediction.expected_duration_bars == 48

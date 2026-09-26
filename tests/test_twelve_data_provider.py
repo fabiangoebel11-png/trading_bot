@@ -100,6 +100,17 @@ def test_equity_profile_uses_one_year_intraday_and_long_daily_history() -> None:
         assert by_timeframe["1d"].history_days == 14600
 
 
+def test_daemon_equity_profile_uses_twelve_data_base_and_local_resampling() -> None:
+    config = load_config("configs/training_tcn_equity_1h.yaml")
+    specs = asset_specs_from_config(config)
+    for asset in ("NASDAQ100_PROXY", "SP500_PROXY"):
+        by_timeframe = {spec.timeframe: spec for spec in specs if spec.name == asset}
+        assert by_timeframe["5m"].provider == "twelve_data"
+        assert by_timeframe["5m"].history_days == 365
+        assert by_timeframe["1h"].provider == "local_derived"
+        assert by_timeframe["4h"].provider == "local_derived"
+
+
 def test_config_uses_explicit_proxy_symbols_and_local_derived_frames() -> None:
     config = load_config("configs/training.yaml")
     specs = asset_specs_from_config(config)

@@ -26,16 +26,14 @@ def test_default_runtime_device_policy_is_cuda_for_training_and_cpu_for_inferenc
     assert config.inference_device == "cpu"
 
 
-def test_resolve_device_cuda_requires_real_cuda() -> None:
+def test_resolve_device_cuda_requires_real_cuda(monkeypatch) -> None:
     import torch
 
-    original = torch.cuda.is_available
-    try:
-        torch.cuda.is_available = lambda: False
-        with pytest.raises(RuntimeError, match="CUDA is required"):
-            resolve_device("cuda")
-    finally:
-        torch.cuda.is_available = original
+    monkeypatch.delenv("TRADING_BOT_FORCE_CPU", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="CUDA is required"):
+        resolve_device("cuda")
 
 
 def test_tcn_model_accepts_explicit_cpu_device() -> None:
