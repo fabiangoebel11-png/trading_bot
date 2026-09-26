@@ -17,9 +17,12 @@ Zwei Taktraten (Hybrid-Polling, analog zu ``execution/live_trader.py``):
 """
 from __future__ import annotations
 
+import json
+import math
+import os
 import time
 import traceback
-import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from functools import wraps
 from datetime import datetime, time as clock_time, timezone
@@ -32,6 +35,7 @@ import pandas as pd
 import state_db
 from train import load_config
 from core.config import TradingBotConfig, TrendMLConfig
+from core.data_loader import drop_incomplete_last_candle
 from core.market_state import DataHealth, FeedStatus, MarketStateService, PredictionSnapshot
 from core.ml.data import load_ohlcv_parquet
 from core.ml.dataset import make_sequences
@@ -58,6 +62,8 @@ ASSISTANT_ASSETS = ("BTC/USDT", "ETH/USDT", "SPY", "QQQ")
 FX_ASSET = "EUR/USD"
 FX_TICKER = "EURUSD=X"
 FX_REFRESH_S = 60.0 * 60.0
+LIVE_MAX_CANDLES = 500
+LIVE_DAILY_DONCHIAN_BARS = 55
 
 # Model 2 (Swing) uses the plain ticker as its asset name; Model 1B (equity
 # intraday) uses the "logical" proxy name from TrendMLConfig.market_assets.
@@ -94,6 +100,69 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _history_days_for_bars(bar_count: int, timeframe: str, session_timezone: str) -> int:
+    normalized_timeframe = f"{timeframe[:-1]}D" if timeframe.lower().endswith("d") else timeframe
+    duration = pd.Timedelta(normalized_timeframe)
+    if duration <= pd.Timedelta(0):
+        raise ValueError(f"Invalid live timeframe: {timeframe!r}")
+    if session_timezone not in {"", "UTC", "Etc/UTC"}:
+        bars_per_session = (
+            1.0
+            if duration >= pd.Timedelta(days=1)
+            else 390.0 / (duration.total_seconds() / 60.0)
+        )
+        return max(1, math.ceil(bar_count / bars_per_session * 7.0 / 5.0))
+    return max(1, math.ceil(bar_count * duration.total_seconds() / 86400.0))
+
+
+def _base_candle_limit(ml_config: TrendMLConfig, asset_name: str) -> int:
+    if (
+        ml_config.base_timeframe == "1h"
+        and "USDT" in asset_name.upper()
+        and "1d" in (ml_config.higher_timeframes or [])
+    ):
+        sequence_length = max(1, int(ml_config.sequence_length))
+        return max(
+            LIVE_MAX_CANDLES,
+            LIVE_DAILY_DONCHIAN_BARS * 24 + sequence_length + 24,
+        )
+    return LIVE_MAX_CANDLES
+
+
+def _bounded_live_specs(config: TradingBotConfig, specs: list[AssetSpec]) -> list[AssetSpec]:
+    bounded = []
+    for spec in specs:
+        definition = config.ml.market_assets.get(spec.name, {})
+        if (
+            spec.timeframe == "5m"
+            and isinstance(definition, dict)
+            and definition.get("derive_from") == "5m"
+            and config.ml.base_timeframe == "1h"
+        ):
+            target_bars = LIVE_MAX_CANDLES
+            target_timeframe = "1h"
+        elif spec.timeframe == config.ml.base_timeframe and spec.name in config.ml.assets:
+            target_bars = _base_candle_limit(config.ml, spec.name)
+            target_timeframe = spec.timeframe
+        else:
+            target_bars = LIVE_MAX_CANDLES
+            target_timeframe = spec.timeframe
+        max_days = _history_days_for_bars(target_bars, target_timeframe, spec.session_timezone)
+        bounded.append(replace(spec, history_days=max(1, min(int(spec.history_days), max_days)), history_start=None))
+    return bounded
+
+
+def _closed_candle_timestamp(frame: pd.DataFrame, timeframe: str) -> str | None:
+    if frame.empty:
+        return None
+    timestamp = pd.Timestamp(frame.index[-1])
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return (timestamp + pd.Timedelta(timeframe)).isoformat()
+
+
 def _load_base_ohlc(ml_config: TrendMLConfig, asset_name: str) -> pd.DataFrame | None:
     specs = [s for s in asset_specs_from_config(TradingBotConfig(ml=ml_config)) if s.name == asset_name and s.timeframe == ml_config.base_timeframe]
     if not specs:
@@ -101,7 +170,12 @@ def _load_base_ohlc(ml_config: TrendMLConfig, asset_name: str) -> pd.DataFrame |
     path = canonical_cache_path(ml_config.market_cache_dir, specs[0])
     if not path.exists():
         return None
-    return load_ohlcv_parquet(path)
+    frame = load_ohlcv_parquet(path)
+    if frame.empty:
+        return frame
+    frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True))
+    frame = drop_incomplete_last_candle(frame.sort_index(), ml_config.base_timeframe)
+    return frame.tail(_base_candle_limit(ml_config, asset_name))
 
 
 def _resolve_training_timeframe(meta: dict, config: TrendMLConfig) -> str:
@@ -262,6 +336,16 @@ class Model1Runner:
         if asset_name not in self._models:
             try:
                 model, meta = load_symbol_model(asset_name, self.config)
+                device = get_device()
+                model_module = getattr(model, "model", None)
+                if device.type == "cuda" and model_module is not None:
+                    try:
+                        model_module.to(device)
+                        model.device = device
+                        model.use_amp = bool(model.config.use_amp)
+                    except Exception as exc:  # noqa: BLE001 - keep inference available if CUDA allocation fails
+                        print(f"[model1] CUDA unavailable for {asset_name}; retaining CPU model: {exc}")
+                        model.to_cpu()
                 if self.config.context_required:
                     training_timeframe = _resolve_training_timeframe(meta, self.config)
                     if training_timeframe != self.config.base_timeframe:
@@ -361,6 +445,8 @@ class LiveDaemon:
         self.model1_crypto = Model1Runner(self.crypto_cfg.ml)
         self._swing_models: dict[str, object] = {}
         self._last_signal_refresh = 0.0
+        self._signal_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-model-refresh")
+        self._signal_future = None
         self._exchange = None
         self.telegram = TelegramBot()
         self._notified_swing: set[tuple[str, str, str]] = set()
@@ -370,7 +456,11 @@ class LiveDaemon:
     def _print_inference_device() -> None:
         try:
             device = get_device()
-            print(f"Inference Device: {device.type.upper()}")
+            chronos_device = os.getenv("CHRONOS2_DEVICE", "").strip().lower()
+            if chronos_device not in {"cpu", "cuda"}:
+                chronos_device = device.type
+                os.environ["CHRONOS2_DEVICE"] = chronos_device
+            print(f"Inference Device: TCN={device.type.upper()}, Chronos-2={chronos_device.upper()}")
         except ImportError:
             print("Inference Device: CPU (PyTorch not installed; ML inference unavailable)")
         except Exception as exc:  # noqa: BLE001 - startup telemetry must not block the daemon
@@ -614,21 +704,29 @@ class LiveDaemon:
         state_db.save_context_snapshot(state_db.DB_PATH, asset, snapshot.timestamp, snapshot.status, snapshot.as_dict(), conn=conn)
 
     @staticmethod
-    def _chronos_forecasts(asset: str, asset_class: str, ohlc: pd.DataFrame) -> dict[str, object]:
+    def _chronos_forecasts(
+        asset: str,
+        asset_class: str,
+        ohlc: pd.DataFrame,
+        source_timestamp: str | None = None,
+    ) -> dict[str, object]:
         """Use Chronos-2 only on horizons with matching bar semantics."""
         horizons = PUBLIC_HORIZONS if asset_class == "crypto" else ("1h", "4h", "8h", "12h")
-        return {
-            horizon: chronos2_forecast(
+        forecasts = {}
+        for horizon in horizons:
+            output = infer_chronos2_forecast(asset, "1h", ohlc, horizon=horizon)
+            if source_timestamp and getattr(output, "status", None) == "AVAILABLE":
+                output = replace(output, data_timestamp=source_timestamp)
+            forecasts[horizon] = chronos2_forecast(
                 asset=asset,
                 asset_class=asset_class,
                 horizon=horizon,
-                output=infer_chronos2_forecast(asset, "1h", ohlc, horizon=horizon),
+                output=output,
             )
-            for horizon in horizons
-        }
+        return forecasts
 
     def _prepare(self, config: TradingBotConfig, *, force_refresh: bool = False) -> None:
-        specs = asset_specs_from_config(config)
+        specs = _bounded_live_specs(config, asset_specs_from_config(config))
         try:
             self._prepare_once(config, specs, force_refresh=force_refresh)
         except Exception as exc:  # noqa: BLE001
@@ -653,11 +751,18 @@ class LiveDaemon:
             from core.ml.train import load_prepared_macro_matrix
 
             macro_df = load_prepared_macro_matrix(self.crypto_cfg.ml)
+            macro_df = macro_df.tail(LIVE_MAX_CANDLES)
         except Exception as exc:  # noqa: BLE001 - missing context must remain explicit
             print(f"[daemon] crypto context matrix unavailable: {exc}")
         breadth = None
         try:
-            breadth = fetch_breadth_basket(self.crypto_cfg.data, self.crypto_cfg.ml, use_cache=True)
+            breadth_history_days = _history_days_for_bars(
+                _base_candle_limit(self.crypto_cfg.ml, self.crypto_cfg.ml.assets[0]),
+                self.crypto_cfg.ml.base_timeframe,
+                "UTC",
+            )
+            breadth_config = replace(self.crypto_cfg.ml, history_days=breadth_history_days)
+            breadth = fetch_breadth_basket(self.crypto_cfg.data, breadth_config, use_cache=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[daemon] breadth basket fetch failed: {exc}")
 
@@ -674,6 +779,7 @@ class LiveDaemon:
                         self._write_signal(
                             conn, symbol, "crypto_sniper", _crypto_signal_from_consensus([], now), now,
                         )
+                        conn.commit()
                         continue
                     self._persist_context_health(conn, symbol, ohlc, macro_df)
                     atr = compute_atr(ohlc["high"], ohlc["low"], ohlc["close"], self.crypto_cfg.ml.atr_window)
@@ -683,13 +789,29 @@ class LiveDaemon:
                         "UPDATE market_state SET atr = ?, atr_pct = ?, warmup_ready = 1 WHERE asset = ?",
                         (last_atr, last_atr / last_close if last_close else 0.0, symbol),
                     )
+                    conn.commit()
+                    source_timestamp = _closed_candle_timestamp(ohlc, self.crypto_cfg.ml.base_timeframe)
                     horizon_outputs = self.model1_crypto.infer_by_horizon(symbol, ohlc, macro_df, breadth)
                     if horizon_outputs is not None:
-                        timestamp, version, outputs = horizon_outputs
-                        forecasts = direct_tcn_forecasts(asset=symbol, asset_class="crypto", model=self.crypto_cfg.ml.model_id, model_version=version, timestamp=timestamp, outputs=outputs)
+                        _, version, outputs = horizon_outputs
+                        forecasts = direct_tcn_forecasts(
+                            asset=symbol,
+                            asset_class="crypto",
+                            model=self.crypto_cfg.ml.model_id,
+                            model_version=version,
+                            timestamp=source_timestamp,
+                            outputs=outputs,
+                        )
                     else:
-                        forecasts = direct_tcn_forecasts(asset=symbol, asset_class="crypto", model=self.crypto_cfg.ml.model_id, model_version="unknown", timestamp=now.isoformat(), outputs={})
-                    chronos = self._chronos_forecasts(symbol, "crypto", ohlc)
+                        forecasts = direct_tcn_forecasts(
+                            asset=symbol,
+                            asset_class="crypto",
+                            model=self.crypto_cfg.ml.model_id,
+                            model_version="unknown",
+                            timestamp=source_timestamp or now.isoformat(),
+                            outputs={},
+                        )
+                    chronos = self._chronos_forecasts(symbol, "crypto", ohlc, source_timestamp)
                     forecasts = [
                         _require_chronos_directional_edge(combine_model_forecasts([forecast, chronos[forecast.horizon]]))
                         for forecast in forecasts
@@ -710,6 +832,7 @@ class LiveDaemon:
                         )
                     except Exception:  # noqa: BLE001 - preserve the daemon loop if even state invalidation fails
                         print(f"[daemon] could not invalidate stale crypto signal for {symbol}:\n{traceback.format_exc()}")
+                conn.commit()
             conn.commit()
 
     def _refresh_equity_and_swing(self, now: datetime, *, force_refresh: bool = False) -> None:
@@ -719,6 +842,7 @@ class LiveDaemon:
             from core.ml.train import load_prepared_macro_matrix
 
             macro_df = load_prepared_macro_matrix(self.equity_cfg.ml)
+            macro_df = macro_df.tail(LIVE_MAX_CANDLES)
         except Exception as exc:  # noqa: BLE001
             print(f"[daemon] equity macro matrix unavailable: {exc}")
 
@@ -726,6 +850,8 @@ class LiveDaemon:
             for name in self.equity_cfg.ml.assets:
                 ticker = EQUITY_NAME_TO_TICKER.get(name, name)
                 horizon_outputs = None
+                ohlc: pd.DataFrame | None = None
+                trend_rule = None
                 conn.execute("DELETE FROM signals WHERE asset = ? AND model_type IN ('intraday', 'swing')", (ticker,))
                 try:
                     ohlc = _load_base_ohlc(self.equity_cfg.ml, name)
@@ -735,6 +861,7 @@ class LiveDaemon:
                             "usable_for_decision=0, freshness='UNKNOWN', reason=? WHERE asset=?",
                             ("Equity data unavailable during refresh; previous forecasts are not actionable.", ticker),
                         )
+                        conn.commit()
                         continue
                     self._persist_context_health(conn, ticker, ohlc, macro_df)
                     atr = compute_atr(ohlc["high"], ohlc["low"], ohlc["close"], self.equity_cfg.ml.atr_window)
@@ -757,9 +884,18 @@ class LiveDaemon:
                     print(f"[daemon] equity rule analysis failed for {name}:\n{traceback.format_exc()}")
                     trend_rule = None
 
+                conn.commit()
                 try:
                     swing_outputs = self._refresh_swing(conn, ticker, now)
-                    chronos = self._chronos_forecasts(ticker, "equity", ohlc)
+                    conn.commit()
+                    source_timestamp = (
+                        _closed_candle_timestamp(ohlc, self.equity_cfg.ml.base_timeframe)
+                        if ohlc is not None and not ohlc.empty else None
+                    )
+                    chronos = (
+                        self._chronos_forecasts(ticker, "equity", ohlc, source_timestamp)
+                        if ohlc is not None and not ohlc.empty else {}
+                    )
                     rule_direction = trend_rule.direction if trend_rule is not None else None
                     rule_score = trend_rule.score if trend_rule is not None else None
                     swing_by_horizon = {}
@@ -794,6 +930,7 @@ class LiveDaemon:
                         "usable_for_decision=0, freshness='UNKNOWN', reason=? WHERE asset=?",
                         ("Equity model refresh failed; previous forecasts are not actionable.", ticker),
                     )
+                    conn.commit()
             conn.commit()
         self._flush_notifications()
 
@@ -1000,11 +1137,14 @@ class LiveDaemon:
         state_db.set_runtime_status("READY", detail)
         return "READY"
 
-    def initialize(self) -> str:
-        """Synchronously build a current, GUI-ready state before polling begins."""
+    def initialize(self, *, background_signals: bool = False) -> str:
+        """Build current market state before polling, optionally refreshing signals in the background."""
         state_db.set_runtime_status("INITIALIZING", "Refreshing market history, context, models, and forecasts.")
         try:
             self.price_tick()
+            if background_signals:
+                self._start_background_signal_refresh(force_refresh=True)
+                return "INITIALIZING"
             self.signal_refresh(force_refresh=True)
             status = self._refresh_runtime_status()
             self._last_signal_refresh = time.monotonic()
@@ -1014,13 +1154,52 @@ class LiveDaemon:
             state_db.set_runtime_status("DATA_UNAVAILABLE", detail)
             return "DATA_UNAVAILABLE"
 
-    def run_cycle(self, *, force_signal: bool = False) -> str:
+    def _run_background_signal_refresh(self, *, force_refresh: bool) -> str:
+        try:
+            self.signal_refresh(force_refresh=force_refresh)
+            return self._refresh_runtime_status()
+        except Exception as exc:  # noqa: BLE001 - the price loop continues while model refresh degrades
+            detail = f"DATA_SOURCE_ERROR: signal refresh failed: {type(exc).__name__}: {exc}"
+            state_db.set_runtime_status("DEGRADED", detail)
+            print(f"[daemon] {detail}")
+            raise
+
+    def _start_background_signal_refresh(self, *, force_refresh: bool) -> bool:
+        future = self._signal_future
+        if future is not None and not future.done():
+            return False
+        self._signal_future = self._signal_executor.submit(
+            self._run_background_signal_refresh,
+            force_refresh=force_refresh,
+        )
+        self._last_signal_refresh = time.monotonic()
+        return True
+
+    def _collect_background_signal_refresh(self) -> str | None:
+        future = self._signal_future
+        if future is None or not future.done():
+            return None
+        self._signal_future = None
+        self._last_signal_refresh = time.monotonic()
+        try:
+            return future.result()
+        except Exception:  # noqa: BLE001 - the worker already persisted the degraded state
+            return "DEGRADED"
+
+    def run_cycle(self, *, force_signal: bool = False, background_signals: bool = False) -> str:
         """Run one order-free live cycle; used by the loop and accelerated tests."""
         try:
             self.price_tick()
         except Exception:  # noqa: BLE001 - preserve loop resilience per cycle
             state_db.set_runtime_status("DEGRADED", "DATA_SOURCE_ERROR: price refresh failed")
             return "DEGRADED"
+        if background_signals:
+            completed_status = self._collect_background_signal_refresh()
+            if force_signal or time.monotonic() - self._last_signal_refresh >= SIGNAL_REFRESH_S:
+                self._start_background_signal_refresh(force_refresh=force_signal)
+            if self._signal_future is not None:
+                return "INITIALIZING"
+            return completed_status or "READY"
         if force_signal or time.monotonic() - self._last_signal_refresh >= SIGNAL_REFRESH_S:
             try:
                 self.signal_refresh(force_refresh=force_signal)
@@ -1033,11 +1212,11 @@ class LiveDaemon:
 
     def run_forever(self) -> None:
         print(f"Live daemon starting, DB={state_db.DB_PATH}")
-        print(f"Startup status: {self.initialize()}")
+        print(f"Startup status: {self.initialize(background_signals=True)}")
         try:
             while True:
                 loop_start = time.monotonic()
-                self.run_cycle()
+                self.run_cycle(background_signals=True)
 
                 elapsed = time.monotonic() - loop_start
                 time.sleep(max(0.0, PRICE_POLL_S - elapsed))

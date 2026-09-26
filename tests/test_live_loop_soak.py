@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, time
+from threading import Event
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -118,6 +120,37 @@ def test_accelerated_live_loop_soak_recovers_without_unnecessary_inference(monke
         assert connection.execute("SELECT status FROM runtime_status WHERE id = 1").fetchone()["status"] == "READY"
 
     print("LIVE_SOAK_TEST=PASS")
+
+
+def test_price_ticks_continue_while_background_signal_refresh_is_running() -> None:
+    daemon = live_daemon.LiveDaemon.__new__(live_daemon.LiveDaemon)
+    daemon._last_signal_refresh = 0.0
+    daemon._signal_executor = ThreadPoolExecutor(max_workers=1)
+    daemon._signal_future = None
+    started = Event()
+    release = Event()
+    ticks = []
+    daemon.price_tick = lambda: ticks.append(True)
+
+    def slow_signal_refresh(*, force_refresh: bool = False) -> None:
+        started.set()
+        if not release.wait(timeout=5.0):
+            raise TimeoutError("test signal refresh was not released")
+
+    daemon.signal_refresh = slow_signal_refresh
+    daemon._refresh_runtime_status = lambda: "READY"
+    try:
+        assert daemon.run_cycle(force_signal=True, background_signals=True) == "INITIALIZING"
+        assert started.wait(timeout=2.0)
+        assert daemon.run_cycle(background_signals=True) == "INITIALIZING"
+        assert len(ticks) == 2
+        release.set()
+        assert daemon._signal_future.result(timeout=2.0) == "READY"
+        assert daemon.run_cycle(background_signals=True) == "READY"
+        assert len(ticks) == 3
+    finally:
+        release.set()
+        daemon._signal_executor.shutdown(wait=True)
     print("VIRTUAL_CYCLES=60")
     print("MODEL_REINFERENCE_TEST=PASS")
     print("NO_UNNECESSARY_INFERENCE=PASS")

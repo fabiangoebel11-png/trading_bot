@@ -9,6 +9,8 @@ import pandas as pd
 import live_daemon
 import state_db
 from core.ml.assistant_forecasts import AssistantForecast, PUBLIC_HORIZONS, combine_model_forecasts, direct_swing_forecasts, direct_tcn_forecasts
+from core.ml.providers import AssetSpec
+from model_integration import ModelForecast
 
 
 def _tcn_output() -> dict:
@@ -123,3 +125,130 @@ def test_swing_forecast_is_returned_below_alert_threshold(monkeypatch, tmp_path)
     assert result is not None
     _, forecasts = result
     assert set(forecasts) == {1, 3, 5, 10, 20}
+
+
+def test_live_asset_specs_are_bounded_by_required_warmup() -> None:
+    crypto_config = SimpleNamespace(ml=SimpleNamespace(
+        assets=["BTC/USDT"], base_timeframe="1h", higher_timeframes=["4h", "1d"],
+        sequence_length=128, market_assets={},
+    ))
+    crypto_specs = [
+        AssetSpec("BTC/USDT", "BTC/USDT", "ccxt", "1h", 3650),
+        AssetSpec("BTC/USDT", "BTC/USDT", "ccxt", "4h", 5475),
+        AssetSpec("BTC/USDT", "BTC/USDT", "ccxt", "1d", 14600),
+    ]
+
+    bounded_crypto = live_daemon._bounded_live_specs(crypto_config, crypto_specs)
+
+    assert {spec.timeframe: spec.history_days for spec in bounded_crypto} == {
+        "1h": 62, "4h": 84, "1d": 500,
+    }
+    assert live_daemon._base_candle_limit(crypto_config.ml, "BTC/USDT") == 1472
+
+    equity_config = SimpleNamespace(ml=SimpleNamespace(
+        assets=["NASDAQ100_PROXY"], base_timeframe="1h", higher_timeframes=["4h", "1d"],
+        sequence_length=128, market_assets={"NASDAQ100_PROXY": {"derive_from": "5m"}},
+    ))
+    equity_specs = [
+        AssetSpec("NASDAQ100_PROXY", "QQQ", "twelve_data", "5m", 365, session_timezone="America/New_York"),
+        AssetSpec("NASDAQ100_PROXY", "QQQ", "local_derived", "1h", 365, session_timezone="America/New_York"),
+        AssetSpec("NASDAQ100_PROXY", "QQQ", "yfinance", "1d", 14600, session_timezone="America/New_York"),
+    ]
+
+    bounded_equity = live_daemon._bounded_live_specs(equity_config, equity_specs)
+
+    assert {spec.timeframe: spec.history_days for spec in bounded_equity} == {
+        "5m": 108, "1h": 108, "1d": 700,
+    }
+    assert all(spec.history_start is None for spec in bounded_equity)
+
+
+def test_base_ohlc_is_closed_utc_and_capped(monkeypatch, tmp_path) -> None:
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    index = pd.date_range(end=now - pd.Timedelta(hours=1), periods=2000, freq="h")
+    frame = pd.DataFrame({column: np.ones(len(index)) for column in ("open", "high", "low", "close", "volume")}, index=index)
+    path = tmp_path / "base.parquet"
+    path.touch()
+    spec = SimpleNamespace(name="BTC/USDT", timeframe="1h")
+    config = SimpleNamespace(
+        base_timeframe="1h", higher_timeframes=["1d"], sequence_length=128,
+        market_cache_dir="unused",
+    )
+    monkeypatch.setattr(live_daemon, "asset_specs_from_config", lambda _config: [spec])
+    monkeypatch.setattr(live_daemon, "canonical_cache_path", lambda *_args: path)
+    monkeypatch.setattr(live_daemon, "load_ohlcv_parquet", lambda _path: frame)
+
+    loaded = live_daemon._load_base_ohlc(config, "BTC/USDT")
+
+    assert loaded is not None
+    assert len(loaded) == 1472
+    assert str(loaded.index.tz) == "UTC"
+    assert loaded.index[-1] == index[-1]
+    assert live_daemon._closed_candle_timestamp(
+        pd.DataFrame(
+            {"close": [100.0]},
+            index=pd.DatetimeIndex([pd.Timestamp("2026-09-26T08:00:00")]),
+        ),
+        "1h",
+    ) == "2026-09-26T09:00:00+00:00"
+
+
+def test_chronos_uses_the_same_utc_close_timestamp_as_tcn(monkeypatch) -> None:
+    old_naive_timestamp = "2026-09-26T08:00:00"
+    output = ModelForecast(
+        status="AVAILABLE", model_id="chronos2", model_version="v1", asset="BTC/USDT",
+        category="INTRADAY", input_timeframe="1h", forecast_horizon="1h", direction="LONG",
+        model_score=65.0, expected_return=0.01, expected_adverse_move=-0.01,
+        expected_favorable_move=0.02, uncertainty="MEDIUM", data_timestamp=old_naive_timestamp,
+        reason="", forecast_low=99.0, forecast_median=101.0, forecast_high=103.0,
+    )
+    source_timestamp = "2026-09-26T09:00:00+00:00"
+    received_timestamps = []
+    monkeypatch.setattr(live_daemon, "infer_chronos2_forecast", lambda *_args, **_kwargs: output)
+    monkeypatch.setattr(
+        live_daemon,
+        "chronos2_forecast",
+        lambda **kwargs: received_timestamps.append(kwargs["output"].data_timestamp) or kwargs["horizon"],
+    )
+
+    forecasts = live_daemon.LiveDaemon._chronos_forecasts(
+        "BTC/USDT", "crypto", pd.DataFrame({"close": [100.0]}), source_timestamp,
+    )
+
+    assert set(forecasts) == set(PUBLIC_HORIZONS)
+    assert received_timestamps == [source_timestamp] * len(PUBLIC_HORIZONS)
+
+
+def test_model1_runner_moves_loaded_tcn_to_cuda_when_available(monkeypatch) -> None:
+    device = SimpleNamespace(type="cuda")
+
+    class FakeModule:
+        def __init__(self):
+            self.moved_to = None
+
+        def to(self, target):
+            self.moved_to = target
+            return self
+
+    class FakeModel:
+        def __init__(self):
+            self.model = FakeModule()
+            self.config = SimpleNamespace(use_amp=True)
+            self.device = SimpleNamespace(type="cpu")
+            self.use_amp = False
+
+        def to_cpu(self):
+            self.device = SimpleNamespace(type="cpu")
+            self.use_amp = False
+
+    model = FakeModel()
+    monkeypatch.setattr(live_daemon, "load_symbol_model", lambda *_args: (model, {}))
+    monkeypatch.setattr(live_daemon, "get_device", lambda: device)
+    runner = live_daemon.Model1Runner(SimpleNamespace(context_required=False))
+
+    loaded = runner._model("BTC/USDT")
+
+    assert loaded is not None
+    assert model.model.moved_to is device
+    assert model.device is device
+    assert model.use_amp
