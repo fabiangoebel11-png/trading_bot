@@ -163,6 +163,34 @@ def test_live_asset_specs_are_bounded_by_required_warmup() -> None:
     assert all(spec.history_start is None for spec in bounded_equity)
 
 
+def test_live_equity_specs_include_both_proxies_with_bounded_weekend_history() -> None:
+    config = live_daemon.load_config(live_daemon.CONFIG_PATHS["equity"])
+    specs = live_daemon._bounded_live_specs(config, live_daemon.asset_specs_from_config(config))
+
+    assert {spec.name for spec in specs} >= {"NASDAQ100_PROXY", "SP500_PROXY"}
+    for asset in ("NASDAQ100_PROXY", "SP500_PROXY"):
+        asset_specs = [spec for spec in specs if spec.name == asset]
+        assert {spec.timeframe for spec in asset_specs} >= {"5m", "1h", "1d"}
+        assert next(spec for spec in asset_specs if spec.timeframe == "5m").provider == "twelve_data"
+        assert next(spec for spec in asset_specs if spec.timeframe == "1d").provider == "yfinance"
+        assert all(spec.history_days <= 700 for spec in asset_specs)
+
+
+def test_signal_refresh_dispatches_equity_history_even_on_weekend(monkeypatch) -> None:
+    weekend = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
+    calls = []
+    daemon = live_daemon.LiveDaemon.__new__(live_daemon.LiveDaemon)
+    daemon.crypto_cfg = SimpleNamespace()
+    daemon.equity_cfg = SimpleNamespace()
+    daemon._refresh_crypto = lambda now, *, force_refresh=False: calls.append(("crypto", now, force_refresh))
+    daemon._refresh_equity_and_swing = lambda now, *, force_refresh=False: calls.append(("equity", now, force_refresh))
+    monkeypatch.setattr(live_daemon, "_now", lambda: weekend)
+
+    daemon.signal_refresh(force_refresh=True)
+
+    assert calls == [("crypto", weekend, True), ("equity", weekend, True)]
+
+
 def test_base_ohlc_is_closed_utc_and_capped(monkeypatch, tmp_path) -> None:
     now = pd.Timestamp.now(tz="UTC").floor("h")
     index = pd.date_range(end=now - pd.Timedelta(hours=1), periods=2000, freq="h")
@@ -242,7 +270,13 @@ def test_model1_runner_moves_loaded_tcn_to_cuda_when_available(monkeypatch) -> N
             self.use_amp = False
 
     model = FakeModel()
-    monkeypatch.setattr(live_daemon, "load_symbol_model", lambda *_args: (model, {}))
+    requested_devices = []
+
+    def fake_load_symbol_model(*args):
+        requested_devices.append(args[-1])
+        return model, {}
+
+    monkeypatch.setattr(live_daemon, "load_symbol_model", fake_load_symbol_model)
     monkeypatch.setattr(live_daemon, "get_device", lambda: device)
     runner = live_daemon.Model1Runner(SimpleNamespace(context_required=False))
 
@@ -252,3 +286,4 @@ def test_model1_runner_moves_loaded_tcn_to_cuda_when_available(monkeypatch) -> N
     assert model.model.moved_to is device
     assert model.device is device
     assert model.use_amp
+    assert requested_devices == ["cuda"]

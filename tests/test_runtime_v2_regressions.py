@@ -60,7 +60,7 @@ def test_model1runner_accepts_legacy_1h_equity_metadata(monkeypatch) -> None:
     cfg = load_config("configs/training_tcn_equity_1h.yaml")
     runner = live_daemon.Model1Runner(cfg.ml)
 
-    def fake_load_symbol_model(symbol: str, config):
+    def fake_load_symbol_model(symbol: str, config, requested_device: str | None = None):
         return object(), {
             "feature_columns": ["feature"],
             "sequence_length": 1,
@@ -78,7 +78,7 @@ def test_model1runner_rejects_true_equity_timeframe_mismatch(monkeypatch) -> Non
     cfg = load_config("configs/training_tcn_equity_1h.yaml")
     runner = live_daemon.Model1Runner(cfg.ml)
 
-    def fake_load_symbol_model(symbol: str, config):
+    def fake_load_symbol_model(symbol: str, config, requested_device: str | None = None):
         return object(), {
             "feature_columns": ["feature"],
             "sequence_length": 1,

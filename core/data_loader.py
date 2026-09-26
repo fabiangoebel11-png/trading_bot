@@ -106,35 +106,53 @@ def fetch_ohlcv_history(
 
     print(f"📥 Lade {target_candles} {timeframe}-Kerzen für {symbol} via CCXT-Pagination...")
     all_ohlcv = existing
+    requested_start_ms = int(requested_start.timestamp() * 1000)
+    requested_end_ms = int(requested_end.timestamp() * 1000)
+    requested_candle_timestamps = {
+        timestamp for timestamp in all_ohlcv
+        if requested_start_ms <= timestamp <= requested_end_ms
+    }
     since = int(requested_start.timestamp() * 1000)
     if all_ohlcv:
         earliest_cached = min(all_ohlcv)
         latest_cached = max(all_ohlcv)
+        if latest_cached < requested_start_ms:
+            since = requested_start_ms
+        else:
         # A short recent cache is missing useful model history and must be
         # backfilled from the requested start. A substantial cache can begin
         # after an exchange product's listing date; restarting at that
         # unavailable prefix only returns duplicates and prevents a live tail
         # refresh. Continue such a seed from its newest candle.
-        seed_coverage = len(all_ohlcv) / max(target_candles, 1)
-        since = since if earliest_cached > since + timeframe_ms and seed_coverage < 0.8 else latest_cached + timeframe_ms
+            seed_coverage = len(requested_candle_timestamps) / max(target_candles, 1)
+            since = (
+                since
+                if earliest_cached > since + timeframe_ms and seed_coverage < 0.8
+                else latest_cached + timeframe_ms
+            )
     consecutive_failures = 0
 
-    requested_end_ms = int(requested_end.timestamp() * 1000)
     while since <= requested_end_ms and (
-        len(all_ohlcv) < target_candles
-        or (all_ohlcv and max(all_ohlcv) < requested_end_ms - timeframe_ms)
+        len(requested_candle_timestamps) < target_candles
+        or (
+            requested_candle_timestamps
+            and max(requested_candle_timestamps) < requested_end_ms - timeframe_ms
+        )
     ):
         try:
             # A complete but stale seed still needs one tail page.  Without
             # this floor, ``target_candles - len(all_ohlcv)`` becomes zero and
             # CCXT receives a no-op request despite a valid newer ``since``.
-            limit = min(1000, max(1, target_candles - len(all_ohlcv)))
-            batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+            limit = min(1000, max(1, target_candles - len(requested_candle_timestamps)))
+            batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)[:limit]
             if not batch:
                 break
             before = len(all_ohlcv)
             for row in batch:
-                all_ohlcv[int(row[0])] = row
+                timestamp = int(row[0])
+                all_ohlcv[timestamp] = row
+                if requested_start_ms <= timestamp <= requested_end_ms:
+                    requested_candle_timestamps.add(timestamp)
             last_timestamp = max(int(row[0]) for row in batch)
             if len(all_ohlcv) == before:
                 break
@@ -142,8 +160,12 @@ def fetch_ohlcv_history(
             consecutive_failures = 0
             partial_frame = pd.DataFrame(sorted(all_ohlcv.values()), columns=OHLCV_COLUMNS)
             partial_frame.to_csv(partial_path, index=False)
-            print(f"  - {symbol}: {len(all_ohlcv)}/{target_candles} Kerzen geladen...")
-            time.sleep(exchange.rateLimit / 1000)
+            print(
+                f"  - {symbol}: {len(requested_candle_timestamps)}/{target_candles} "
+                f"angefragte Kerzen geladen ({len(all_ohlcv)} insgesamt im Cache)..."
+            )
+            if len(requested_candle_timestamps) < target_candles or max(requested_candle_timestamps) < requested_end_ms - timeframe_ms:
+                time.sleep(exchange.rateLimit / 1000)
         except Exception as exc:  # noqa: BLE001 - network layer, log and stop pagination
             consecutive_failures += 1
             if consecutive_failures > max_retries:

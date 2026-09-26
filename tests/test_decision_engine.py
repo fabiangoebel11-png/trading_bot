@@ -70,13 +70,17 @@ def test_assistant_position_and_scenario_persist_without_paper_trade(tmp_path) -
     assert paper_trade == 0
 
 
-def test_real_btc_cache_produces_selection_and_plan() -> None:
+def test_real_btc_cache_is_analyzable_and_only_plans_valid_setups() -> None:
     frame = load_cached_ohlcv("BTC/USDT", "1h", "data")
     if frame is None:
         pytest.skip("BTC cache unavailable in this checkout")
     result = analyse_ohlcv("BTC/USDT", "1h", frame, capital=500.0, asset_class="crypto")
     assert result.indicators is not None
     assert result.regime in {"TREND_UP", "TREND_DOWN", "RANGE", "HIGH_VOLATILITY", "LOW_VOLATILITY", "UNCLEAR"}
+    if result.best_candidate is None:
+        assert result.data_status == "NO_VALID_SETUP"
+        assert result.plan is None
+        return
     assert result.best_candidate is not None
     assert result.plan is not None
     assert result.plan.notional > 0

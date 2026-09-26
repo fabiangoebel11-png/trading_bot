@@ -22,7 +22,11 @@ from core.ml.regime import classify_regimes, ml_regime_active
 from core.ml.tcn_model import TCNTrendModel
 
 
-def load_symbol_model(symbol: str, config: TrendMLConfig) -> tuple[TCNTrendModel, dict]:
+def load_symbol_model(
+    symbol: str,
+    config: TrendMLConfig,
+    requested_device: str | None = None,
+) -> tuple[TCNTrendModel, dict]:
     import dataclasses
 
     import torch  # local import: optional dependency
@@ -58,9 +62,17 @@ def load_symbol_model(symbol: str, config: TrendMLConfig) -> tuple[TCNTrendModel
         state["horizon_target_scales"] = meta["horizon_target_scales"]
     if "horizon_duration_active" not in state and meta.get("horizon_duration_active"):
         state["horizon_duration_active"] = meta["horizon_duration_active"]
-    model = TCNTrendModel(arch_config, n_features=state["n_features"], forecast_horizons=horizons, prefer_cuda=False, asset=symbol)
+    model = TCNTrendModel(
+        arch_config,
+        n_features=state["n_features"],
+        forecast_horizons=horizons,
+        prefer_cuda=requested_device is not None,
+        requested_device=requested_device,
+        asset=symbol,
+    )
     model.load_state_dict(state)
-    model.to_cpu()
+    if requested_device is None:
+        model.to_cpu()
     return model, meta
 
 

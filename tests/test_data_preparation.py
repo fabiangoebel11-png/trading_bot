@@ -83,6 +83,38 @@ def test_ccxt_substantial_late_seed_continues_from_its_tail(monkeypatch, tmp_pat
     assert calls[0][0] == int((index.max() + pd.Timedelta(hours=1)).timestamp() * 1000)
 
 
+def test_ccxt_oversized_seed_pages_by_requested_window_not_total_cache(monkeypatch, tmp_path: Path, capsys) -> None:
+    now = pd.Timestamp.utcnow().tz_convert("UTC").floor("h")
+    seed_index = pd.date_range(end=now - pd.Timedelta(days=120), periods=19_927, freq="1h")
+    seed = pd.DataFrame(
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0},
+        index=seed_index,
+    )
+    calls = []
+
+    class RecoveringExchange(_FakeExchange):
+        def fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int):
+            calls.append((since, limit))
+            end_ms = int(now.timestamp() * 1000)
+            return [
+                [timestamp, 100.0, 101.0, 99.0, 100.0, 1.0]
+                for timestamp in range(since, end_ms + 1, 3_600_000)
+            ][:limit]
+
+    monkeypatch.setattr(data_loader.ccxt, "fake", RecoveringExchange, raising=False)
+    frame = data_loader.fetch_ohlcv_history(
+        "BTC/USDT", "1h", 21, cache_dir=str(tmp_path), exchange_id="fake", use_cache=False,
+        seed_frame=seed,
+    )
+
+    assert len(calls) <= 2
+    assert calls[0][1] > 1
+    assert calls[0][0] >= int((now - pd.Timedelta(days=21)).timestamp() * 1000)
+    assert len(frame) >= len(seed)
+    assert frame.index.max() > seed_index[-1].tz_localize(None) + pd.Timedelta(days=100)
+    assert "angefragte Kerzen geladen" in capsys.readouterr().out
+
+
 def test_quality_report_distinguishes_session_volume_and_coverage() -> None:
     index = pd.date_range("2024-01-01", periods=3, freq="1d", tz="UTC")
     frame = pd.DataFrame(

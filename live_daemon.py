@@ -335,17 +335,13 @@ class Model1Runner:
             return None
         if asset_name not in self._models:
             try:
-                model, meta = load_symbol_model(asset_name, self.config)
                 device = get_device()
+                model, meta = load_symbol_model(asset_name, self.config, device.type)
                 model_module = getattr(model, "model", None)
-                if device.type == "cuda" and model_module is not None:
-                    try:
-                        model_module.to(device)
-                        model.device = device
-                        model.use_amp = bool(model.config.use_amp)
-                    except Exception as exc:  # noqa: BLE001 - keep inference available if CUDA allocation fails
-                        print(f"[model1] CUDA unavailable for {asset_name}; retaining CPU model: {exc}")
-                        model.to_cpu()
+                if model_module is not None:
+                    model_module.to(device)
+                    model.device = device
+                    model.use_amp = bool(model.config.use_amp and device.type == "cuda")
                 if self.config.context_required:
                     training_timeframe = _resolve_training_timeframe(meta, self.config)
                     if training_timeframe != self.config.base_timeframe:
@@ -727,10 +723,16 @@ class LiveDaemon:
 
     def _prepare(self, config: TradingBotConfig, *, force_refresh: bool = False) -> None:
         specs = _bounded_live_specs(config, asset_specs_from_config(config))
+        assets = ",".join(config.ml.assets)
+        timeframes = ",".join(sorted({spec.timeframe for spec in specs}))
+        print(
+            f"[daemon] preparing {config.ml.model_id} historical inputs "
+            f"for {assets} ({timeframes}; bounded warmup)"
+        )
         try:
             self._prepare_once(config, specs, force_refresh=force_refresh)
         except Exception as exc:  # noqa: BLE001
-            print(f"[daemon] data refresh failed (using stale cache if present): {exc}")
+            print(f"[daemon] {config.ml.model_id} data refresh failed (using stale cache if present): {exc}")
 
     @retry_with_backoff()
     def _prepare_once(self, config: TradingBotConfig, specs, *, force_refresh: bool = False) -> None:
